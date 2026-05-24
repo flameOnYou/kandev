@@ -15,11 +15,16 @@ import {
 import { setEnvLayout } from "@/lib/local-storage";
 import { panelPortalManager } from "@/lib/layout/panel-portal-manager";
 import { stopVscode } from "@/lib/api/domains/vscode-api";
-import { stopUserShell } from "@/lib/api/domains/user-shell-api";
+import { parkUserShell, stopUserShell } from "@/lib/api/domains/user-shell-api";
 
 // v2: bumped alongside DOCKVIEW_ENV_LAYOUT_PREFIX so the no-env fallback
 // also invalidates layouts saved under the previous caps.
 const LAYOUT_STORAGE_KEY = "dockview-layout-v2";
+const terminalTerminateClosePanelIds = new Set<string>();
+
+export function markTerminalPanelTerminateClose(panelId: string): void {
+  terminalTerminateClosePanelIds.add(panelId);
+}
 
 /**
  * Pinned-column target enforcement.
@@ -307,59 +312,86 @@ export function setupLayoutPersistence(
   };
 }
 
+/** When the last non-sidebar panel is closed while maximized, exit maximize
+ *  and drop the closed panel from the restored pre-maximize layout. */
+function handleMaximizeExitOnLastClose(
+  api: DockviewReadyEvent["api"],
+  removedId: string,
+  nonSidebarRemaining: number,
+): void {
+  if (!(useDockviewStore.getState().preMaximizeLayout !== null) || nonSidebarRemaining > 0) return;
+  requestAnimationFrame(() => {
+    useDockviewStore.getState().exitMaximizedLayout();
+    requestAnimationFrame(() => {
+      const restoredPanel = api.getPanel(removedId);
+      if (restoredPanel) restoredPanel.api.close();
+    });
+  });
+}
+
+/** Resolve a session id whose env matches the closed panel's env, used for
+ *  session-scoped stops like stopVscode. */
+function resolveSessionForEntry(
+  appStore: StoreApi<AppState>,
+  entryEnvId: string | undefined,
+): string | null {
+  const state = appStore.getState();
+  const active = state.tasks.activeSessionId;
+  if (!entryEnvId) return active;
+  if (active && state.environmentIdBySessionId[active] === entryEnvId) return active;
+  const match = Object.entries(state.environmentIdBySessionId).find(
+    ([, eid]) => eid === entryEnvId,
+  );
+  return match?.[0] ?? active;
+}
+
+/** Tab close → ordinary terminals park (PTY + DB row survive, reappear in
+ *  the "+" menu); scripts/bottom-panel/legacy passthrough still destroy. */
+function handleTerminalPanelClosed(
+  appStore: StoreApi<AppState>,
+  panelId: string,
+  params: Record<string, unknown>,
+): void {
+  if (terminalTerminateClosePanelIds.delete(panelId)) return;
+  const terminalId = params.terminalId as string | undefined;
+  if (!terminalId) return;
+  const stampedEnv = params.environmentId as string | undefined;
+  const stampedTaskID = params.taskID as string | undefined;
+  const state = appStore.getState();
+  const active = state.tasks.activeSessionId;
+  const fallbackEnv = active ? (state.environmentIdBySessionId[active] ?? null) : null;
+  const envForTerminal = stampedEnv || fallbackEnv;
+  if (!envForTerminal) return;
+  const shell = state.userShells.byEnvironmentId[envForTerminal]?.find(
+    (s) => s.terminalId === terminalId,
+  );
+  if (shell?.kind === "ordinary") {
+    parkUserShell(terminalId, stampedTaskID).then(
+      () => state.updateUserShell(envForTerminal, terminalId, { state: "parked" }),
+      (err: unknown) => console.error("park terminal on tab close:", err),
+    );
+  } else {
+    stopUserShell(envForTerminal, terminalId, stampedTaskID).catch((err: unknown) =>
+      console.warn("stop terminal on tab close:", err),
+    );
+  }
+}
+
 export function setupPortalCleanup(
   api: DockviewReadyEvent["api"],
   appStore: StoreApi<AppState>,
 ): void {
   api.onDidRemovePanel((panel) => {
     if (useDockviewStore.getState().isRestoringLayout) return;
-    const isMax = useDockviewStore.getState().preMaximizeLayout !== null;
-    const remaining = api.panels.filter((p) => p.id !== panel.id);
-    const nonSidebar = remaining.filter((p) => p.api.component !== "sidebar");
-    // If we're in maximize mode and the last non-sidebar panel was just closed,
-    // exit maximize to restore the pre-maximize layout (avoids empty view).
-    // Then remove the closed panel from the restored layout so it doesn't reappear.
-    if (isMax && nonSidebar.length === 0) {
-      const removedId = panel.id;
-      requestAnimationFrame(() => {
-        useDockviewStore.getState().exitMaximizedLayout();
-        // exitMaximizedLayout schedules a rAF to finalize — wait for that, then
-        // remove the panel that was closed (it was re-created from preMaximizeLayout).
-        requestAnimationFrame(() => {
-          const restoredPanel = api.getPanel(removedId);
-          if (restoredPanel) {
-            restoredPanel.api.close();
-          }
-        });
-      });
-    }
+    const nonSidebarRemaining = api.panels.filter(
+      (p) => p.id !== panel.id && p.api.component !== "sidebar",
+    ).length;
+    handleMaximizeExitOnLastClose(api, panel.id, nonSidebarRemaining);
     const entry = panelPortalManager.get(panel.id);
-    // vscode is session-scoped; resolve to a session in the entry's env (or
-    // the active session) for the stop call.
-    const sessionForApi = (() => {
-      const state = appStore.getState();
-      const active = state.tasks.activeSessionId;
-      if (!entry?.envId) return active;
-      if (active && state.environmentIdBySessionId[active] === entry.envId) return active;
-      const match = Object.entries(state.environmentIdBySessionId).find(
-        ([, eid]) => eid === entry.envId,
-      );
-      return match?.[0] ?? active;
-    })();
+    const sessionForApi = resolveSessionForEntry(appStore, entry?.envId);
     if (entry?.component === "vscode" && sessionForApi) stopVscode(sessionForApi);
-    if (entry?.component === "terminal") {
-      const terminalId = entry.params.terminalId as string | undefined;
-      // Prefer the env id stamped into params at creation time — this
-      // survives task switches that happen between open and close. Fall
-      // back to the active session's env for legacy panels created before
-      // the param was added (e.g. layouts persisted from older releases).
-      const stampedEnv = entry.params.environmentId as string | undefined;
-      const state = appStore.getState();
-      const active = state.tasks.activeSessionId;
-      const fallbackEnv = active ? (state.environmentIdBySessionId[active] ?? null) : null;
-      const envForTerminal = stampedEnv || fallbackEnv;
-      if (terminalId && envForTerminal) stopUserShell(envForTerminal, terminalId);
-    }
+    if (entry?.component === "terminal")
+      handleTerminalPanelClosed(appStore, panel.id, entry.params);
     panelPortalManager.release(panel.id);
   });
 }
