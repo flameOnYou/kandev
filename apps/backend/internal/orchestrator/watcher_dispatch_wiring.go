@@ -1,0 +1,69 @@
+package orchestrator
+
+import (
+	"context"
+	"fmt"
+
+	"go.uber.org/zap"
+)
+
+// serviceTaskStarter adapts Service.StartTask to the coordinator's
+// taskStarter interface. Lives in its own file so the wiring stays close
+// to the Service definition without polluting watcher_dispatch.go with
+// orchestrator-internal types.
+type serviceTaskStarter struct{ svc *Service }
+
+func (s serviceTaskStarter) Start(ctx context.Context, taskID, workflowStepID string, p AutoStartParams) error {
+	_, err := s.svc.StartTask(
+		ctx, taskID, p.AgentProfileID, "", p.ExecutorProfileID,
+		"", p.Prompt, workflowStepID, false, true, nil,
+	)
+	return err
+}
+
+// initWatcherCoordinator builds the coordinator (once) and (always) refreshes
+// the mutable taskCreator dependency. Called from SetIssueTaskCreator, which
+// can be invoked multiple times — tests in particular may swap creators
+// between scenarios. Re-running the setter MUST update the coordinator,
+// otherwise Dispatch silently keeps the original creator.
+func (s *Service) initWatcherCoordinator() {
+	if s.watcherCoordinator == nil {
+		s.watcherCoordinator = &WatcherDispatchCoordinator{
+			startTask: serviceTaskStarter{svc: s},
+			shouldAutoStart: func(ctx context.Context, stepID string) bool {
+				return s.shouldAutoStartStep(ctx, stepID)
+			},
+			logger: s.logger,
+		}
+	}
+	// Always refresh: SetIssueTaskCreator may be called more than once.
+	s.watcherCoordinator.taskCreator = s.issueTaskCreator
+}
+
+// dispatchWatcherEvent runs the wiring guards every per-integration bus
+// handler shares — issueTaskCreator check, coordinator check, and the
+// final goroutine dispatch with cancellation detached. integration is used
+// in log message templating ("new linear issue ...", "skipping jira task ...").
+// fields are the structured log fields that identify the event in operator
+// logs; pass at least the issue_watch_id and an integration-specific
+// identifier field so a deferred / dropped event is diagnosable.
+//
+// Lives in its own helper so per-integration handlers stay below dupl's
+// duplicate-block threshold without copy-pasting the same guards.
+func (s *Service) dispatchWatcherEvent(ctx context.Context, integration string, src WatcherSource, evt any, fields ...zap.Field) {
+	s.logger.Info(fmt.Sprintf("new %s issue detected from watch", integration), fields...)
+	if s.issueTaskCreator == nil {
+		s.logger.Warn(fmt.Sprintf("issue task creator not configured, skipping %s task creation", integration))
+		return
+	}
+	if s.watcherCoordinator == nil {
+		// Defensive: coordinator is wired by SetIssueTaskCreator. If we got
+		// here without the creator we already returned above; this is just
+		// a belt-and-braces guard for tests that wire pieces individually.
+		s.logger.Warn(fmt.Sprintf("watcher coordinator not configured, skipping %s task dispatch", integration), fields...)
+		return
+	}
+	// Detach from cancellation but keep request-scoped values (tracing, etc.):
+	// the bus delivery context may be cancelled before task creation finishes.
+	go s.watcherCoordinator.Dispatch(context.WithoutCancel(ctx), src, evt)
+}
