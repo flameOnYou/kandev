@@ -130,6 +130,76 @@ func TestGetGitStatus_UntrackedFileWithSpaces(t *testing.T) {
 	}
 }
 
+// TestGetGitStatus_FreshBypassesStaleCache simulates the bug class where the
+// poll loop missed a HEAD change (paused mode, dropped tick) and left
+// currentStatus.Files holding pre-commit entries. fresh=true must re-run
+// `git status --porcelain` and return ground truth, not the cached snapshot.
+func TestGetGitStatus_FreshBypassesStaleCache(t *testing.T) {
+	repoDir, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	log := newTestLogger(t)
+	wt := NewWorkspaceTracker(repoDir, log)
+	ctx := context.Background()
+
+	// Commit a file so we have something to modify.
+	writeFile(t, repoDir, "tracked.txt", "v1")
+	runGit(t, repoDir, "add", ".")
+	runGit(t, repoDir, "commit", "-m", "add tracked")
+
+	// Dirty the worktree and prime the cache by running an update.
+	writeFile(t, repoDir, "tracked.txt", "v2")
+	wt.updateGitStatus(ctx)
+
+	cached, err := wt.GetGitStatus(ctx, false)
+	if err != nil {
+		t.Fatalf("priming GetGitStatus failed: %v", err)
+	}
+	if _, ok := cached.Files["tracked.txt"]; !ok {
+		t.Fatalf("expected priming run to cache tracked.txt as modified; got Files=%v", mapKeys(cached.Files))
+	}
+
+	// Simulate the bug: commit the file but DO NOT refresh the tracker (this
+	// is what happens when the poll loop is paused or drops a tick at the
+	// exact moment HEAD moves).
+	runGit(t, repoDir, "add", ".")
+	runGit(t, repoDir, "commit", "-m", "commit v2")
+
+	// Precondition: cache must still hold the pre-commit entry — confirms the
+	// stale-cache scenario the fresh path is supposed to bypass.
+	stale, err := wt.GetGitStatus(ctx, false)
+	if err != nil {
+		t.Fatalf("stale GetGitStatus failed: %v", err)
+	}
+	if _, ok := stale.Files["tracked.txt"]; !ok {
+		t.Fatalf("expected cache to still hold pre-commit entry (test setup invalid); got Files=%v", mapKeys(stale.Files))
+	}
+
+	// fresh=true must bypass the cache and produce a clean status.
+	fresh, err := wt.GetGitStatus(ctx, true)
+	if err != nil {
+		t.Fatalf("fresh GetGitStatus failed: %v", err)
+	}
+	if len(fresh.Files) != 0 {
+		t.Errorf("fresh=true should reflect the clean worktree; got Files=%v", mapKeys(fresh.Files))
+	}
+	if len(fresh.Modified) != 0 {
+		t.Errorf("fresh=true should produce empty Modified; got %v", fresh.Modified)
+	}
+
+	// Contract: a fresh read MUST NOT mutate the shared cache. The poll loop
+	// owns currentStatus; subscribe-time fresh reads short-circuit it without
+	// writing back, so already-subscribed observers still see the cached
+	// stream until the poll loop catches up.
+	afterFresh, err := wt.GetGitStatus(ctx, false)
+	if err != nil {
+		t.Fatalf("post-fresh GetGitStatus failed: %v", err)
+	}
+	if _, ok := afterFresh.Files["tracked.txt"]; !ok {
+		t.Errorf("fresh=true must not overwrite the cache; expected stale entry to remain, got Files=%v", mapKeys(afterFresh.Files))
+	}
+}
+
 // mapKeys returns the keys of a map for diagnostic output.
 func mapKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))

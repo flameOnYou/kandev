@@ -214,7 +214,8 @@ func tryGetLiveGitStatus(ctx context.Context, lifecycleMgr *lifecycle.Manager, s
 	// Use bounded timeout to prevent blocking session hydration if agentctl is stuck.
 	rpcCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	multi, err := agentClient.GetGitStatusMulti(rpcCtx)
+	// Force fresh git query: cache can wedge when the poll loop misses a HEAD change.
+	multi, err := agentClient.GetGitStatusMultiFresh(rpcCtx)
 	if err != nil {
 		log.Debug("failed to get live git status, will fall back to DB snapshot",
 			zap.String("session_id", sessionID),

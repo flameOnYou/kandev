@@ -571,14 +571,20 @@ type MultiRepoGitStatusResult struct {
 	Error   string             `json:"error,omitempty"`
 }
 
-// GetGitStatusMulti returns one status entry per repo (multi-repo) or a
-// single untagged entry (single-repo). Used by the session-subscribe handler
-// in the main backend to seed the frontend's per-repo state on page reload —
-// without it, the frontend never sees per-repo grouping until something else
-// (a file change, a poll) pushes a stamped notification.
-func (c *Client) GetGitStatusMulti(ctx context.Context) (*MultiRepoGitStatusResult, error) {
+// GetGitStatusMultiFresh returns one status entry per repo (multi-repo) or a
+// single untagged entry (single-repo) with the workspace tracker's cache
+// bypassed — each repo re-runs `git status --porcelain` against the worktree.
+// Used by the session-subscribe handler in the main backend so a new observer
+// always sees a validated snapshot rather than a possibly-stale cached one.
+//
+// The fresh path is read-only with respect to the cache: it returns the live
+// query but does not write the result back into the tracker's currentStatus.
+// That's intentional — the poll loop owns the cache, and writing here would
+// race with concurrent polls. Already-subscribed observers continue to see
+// the cached stream until the poll loop catches up.
+func (c *Client) GetGitStatusMultiFresh(ctx context.Context) (*MultiRepoGitStatusResult, error) {
 	var result MultiRepoGitStatusResult
-	status, err := c.fetchJSONResult(ctx, "/api/v1/git/status/multi", &result)
+	status, err := c.fetchJSONResult(ctx, "/api/v1/git/status/multi?fresh=true", &result)
 	if err != nil {
 		return nil, err
 	}

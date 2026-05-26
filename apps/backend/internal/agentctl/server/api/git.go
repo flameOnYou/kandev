@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -1069,7 +1070,9 @@ type MultiRepoGitStatusResult struct {
 // session-subscribe handler in the main backend to seed per-repo state on
 // page reload — the legacy single GET /api/v1/git/status endpoint returns
 // only the workspace-root status, which is empty for multi-repo task roots
-// (the root isn't itself a git repo).
+// (the root isn't itself a git repo). Pass ?fresh=true to bypass the cached
+// status and run a fresh git query — used on WS subscribe so a new observer
+// always validates the cache against the live worktree.
 func (s *Server) handleGitStatusMulti(c *gin.Context) {
 	subpaths := s.procMgr.RepoSubpaths()
 	// Single-repo: fall back to the workspace-root status with an empty repo
@@ -1077,19 +1080,29 @@ func (s *Server) handleGitStatusMulti(c *gin.Context) {
 	if len(subpaths) == 0 {
 		subpaths = []string{""}
 	}
-	result := MultiRepoGitStatusResult{Success: true, Repos: make([]PerRepoGitStatus, 0, len(subpaths))}
-	for _, sub := range subpaths {
-		entry := s.collectStatusForRepo(c, sub)
-		result.Repos = append(result.Repos, entry)
+	fresh := c.Query("fresh") == queryParamTrue
+	// Parallel fan-out: fresh=true skips the cache, so serial scales linearly and would blow the 2s subscribe timeout for multi-repo workspaces.
+	result := MultiRepoGitStatusResult{Success: true, Repos: make([]PerRepoGitStatus, len(subpaths))}
+	ctx := c.Request.Context()
+	var wg sync.WaitGroup
+	for i, sub := range subpaths {
+		wg.Add(1)
+		go func(i int, sub string) {
+			defer wg.Done()
+			result.Repos[i] = s.collectStatusForRepo(ctx, sub, fresh)
+		}(i, sub)
 	}
+	wg.Wait()
 	c.JSON(http.StatusOK, result)
 }
 
 // collectStatusForRepo runs the status query for a single subpath and packs
-// it into a PerRepoGitStatus. Failures land in Status.Error / Status.Success
-// so the caller can render partial results instead of erroring out the whole
-// fan-out when one repo is misconfigured.
-func (s *Server) collectStatusForRepo(c *gin.Context, sub string) PerRepoGitStatus {
+// it into a PerRepoGitStatus. When fresh is true the workspace tracker
+// re-runs `git status --porcelain` against the worktree instead of returning
+// the cached snapshot. Failures land in Status.Error / Status.Success so the
+// caller can render partial results instead of erroring out the whole fan-out
+// when one repo is misconfigured.
+func (s *Server) collectStatusForRepo(ctx context.Context, sub string, fresh bool) PerRepoGitStatus {
 	wt, wtErr := s.procMgr.GetWorkspaceTrackerFor(sub)
 	if wtErr != nil {
 		return PerRepoGitStatus{
@@ -1103,7 +1116,7 @@ func (s *Server) collectStatusForRepo(c *gin.Context, sub string) PerRepoGitStat
 			Status:         GitStatusResult{Success: false, Error: "workspace tracker not available"},
 		}
 	}
-	status, err := wt.GetCurrentGitStatus(c.Request.Context())
+	status, err := wt.GetGitStatus(ctx, fresh)
 	if err != nil {
 		return PerRepoGitStatus{
 			RepositoryName: sub,
