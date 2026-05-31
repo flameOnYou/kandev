@@ -204,22 +204,38 @@ func scenarioError(e *emitter) {
 	e.text("E2E test error: simulated failure")
 }
 
-// scenarioSubagent: subagent with child messages and fixed delays.
+// scenarioSubagent: a claude-style subagent (Task) tool call carrying the
+// `_meta.claudeCode` Agent marker and a toolResponse with full result metrics,
+// so the kandev adapter normalizes it to a subagent_task payload and the UI
+// renders the subagent card with metadata chips.
 func scenarioSubagent(e *emitter) {
 	taskToolID := nextToolID()
 	fixedDelay(50)
 
-	e.startTool(taskToolID, "E2E subagent test", acp.ToolKindOther,
-		map[string]any{
-			"description": "E2E subagent test",
-			"prompt":      "Run e2e subagent scenario",
-		})
+	e.startSubagentTool(taskToolID,
+		"Explore the codebase",
+		"Find all files and summarize the project structure",
+		"general-purpose")
 
 	fixedDelay(50)
 	e.text("Subagent working on the task...")
 
+	// A tool call the subagent runs internally, attributed to the Task via
+	// `_meta.claudeCode.parentToolUseId` so it nests under the subagent card.
+	childToolID := nextToolID()
+	e.startChildTool(childToolID, taskToolID, "sleep 30", acp.ToolKindExecute,
+		map[string]any{"command": "sleep 30"})
 	fixedDelay(50)
-	e.completeTool(taskToolID, map[string]any{"result": "E2E subagent completed"})
+	e.completeChildTool(childToolID, taskToolID, map[string]any{"output": ""})
+
+	fixedDelay(50)
+	e.completeSubagentTool(taskToolID, "E2E subagent completed", subagentResult{
+		agentID:      "agent_e2e_0001",
+		subagentType: "general-purpose",
+		durationMs:   2200,
+		totalTokens:  9987,
+		toolUseCount: 3,
+	})
 
 	fixedDelay(50)
 	e.text("Subagent scenario complete.")
