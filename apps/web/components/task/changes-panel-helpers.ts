@@ -172,6 +172,7 @@ type MergedCommit = {
   pushed: boolean;
   /** Multi-repo: name of the repo this commit was made in. Empty for single-repo. */
   repository_name?: string;
+  committed_at?: string;
 };
 
 /**
@@ -194,8 +195,15 @@ export function mergeCommits(
     /** Multi-repo: name of the repo this commit was made in. */
     repository_name?: string;
     pushed?: boolean;
+    committed_at?: string;
   }[],
-  prCommits: { sha: string; message: string; additions: number; deletions: number }[],
+  prCommits: {
+    sha: string;
+    message: string;
+    additions: number;
+    deletions: number;
+    author_date?: string;
+  }[],
 ): MergedCommit[] {
   const shaMatches = (a: string, b: string) => a.startsWith(b) || b.startsWith(a);
   const unpushed: MergedCommit[] = [];
@@ -225,6 +233,7 @@ export function mergeCommits(
         insertions: pr.additions,
         deletions: pr.deletions,
         pushed: true,
+        committed_at: pr.author_date,
       });
     }
   }
