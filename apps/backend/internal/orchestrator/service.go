@@ -301,6 +301,11 @@ type Service struct {
 	// SetLinearService so handlers don't allocate per bus event.
 	linearSource *LinearWatcherSource
 
+	// Sentry service for issue watch dedup operations
+	sentryService SentryService
+	// sentrySource adapts sentryService onto WatcherSource. Built once in
+	// SetSentryService so handlers don't allocate per bus event.
+	sentrySource *SentryWatcherSource
 	// GitLab service + task creators for auto-creating tasks from review /
 	// issue watch events. When the task creators are nil the events are
 	// logged but no tasks are created — matches the GitHub flow when a
@@ -846,6 +851,9 @@ func (s *Service) Start(ctx context.Context) error {
 
 	// Subscribe to Linear integration events
 	s.subscribeLinearEvents()
+
+	// Subscribe to Sentry integration events
+	s.subscribeSentryEvents()
 
 	// Subscribe to automation events
 	s.subscribeAutomationEvents()

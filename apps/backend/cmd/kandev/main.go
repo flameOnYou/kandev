@@ -35,6 +35,7 @@ import (
 	// JIRA integration
 	jirapkg "github.com/kandev/kandev/internal/jira"
 	linearpkg "github.com/kandev/kandev/internal/linear"
+	sentrypkg "github.com/kandev/kandev/internal/sentry"
 	slackpkg "github.com/kandev/kandev/internal/slack"
 
 	// Agent infrastructure
@@ -485,6 +486,16 @@ func startAgentInfrastructure(
 		linearPoller := linearpkg.NewPoller(services.Linear, log)
 		linearPoller.Start(ctx)
 		addCleanup(func() error { linearPoller.Stop(); return nil })
+	}
+
+	// Start Sentry poller: an auth-health probe plus an issue-watch loop that
+	// runs configured filters and emits NewSentryIssueEvent. The dedup adapter
+	// lets the orchestrator turn matching Sentry issues into kandev tasks.
+	if services.Sentry != nil {
+		orchestratorSvc.SetSentryService(&sentryServiceAdapter{svc: services.Sentry})
+		sentryPoller := sentrypkg.NewPoller(services.Sentry, log)
+		sentryPoller.Start(ctx)
+		addCleanup(func() error { sentryPoller.Stop(); return nil })
 	}
 
 	// Start Slack auth-health poller and the trigger loop. The trigger

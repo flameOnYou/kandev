@@ -1313,7 +1313,7 @@ export class ApiClient {
    * navigating, otherwise the import bar can race the first render.
    */
   async waitForIntegrationAuthHealthy(
-    integration: "jira" | "linear",
+    integration: "jira" | "linear" | "sentry",
     timeoutMs = 5_000,
   ): Promise<void> {
     const deadline = Date.now() + timeoutMs;
@@ -1414,6 +1414,34 @@ export class ApiClient {
 
   async mockLinearSetGetIssueError(args: { statusCode: number; message: string }): Promise<void> {
     await this.request("PUT", "/api/v1/linear/mock/get-issue-error", args);
+  }
+
+  // --- Sentry Mock Control ---
+
+  async mockSentryReset(): Promise<void> {
+    await this.request("DELETE", "/api/v1/sentry/mock/reset");
+  }
+
+  async mockSentrySetAuthResult(result: {
+    ok: boolean;
+    userId?: string;
+    displayName?: string;
+    email?: string;
+    error?: string;
+  }): Promise<void> {
+    await this.request("PUT", "/api/v1/sentry/mock/auth-result", result);
+  }
+
+  async mockSentrySetAuthHealth(args: { ok: boolean; error?: string }): Promise<void> {
+    await this.request("PUT", "/api/v1/sentry/mock/auth-health", args);
+  }
+
+  async mockSentrySetOrganizations(organizations: MockSentryOrganization[]): Promise<void> {
+    await this.request("POST", "/api/v1/sentry/mock/organizations", { organizations });
+  }
+
+  async mockSentrySetProjects(projects: MockSentryProject[]): Promise<void> {
+    await this.request("POST", "/api/v1/sentry/mock/projects", { projects });
   }
 
   // --- Linear issue watch CRUD ---
@@ -1764,3 +1792,9 @@ export type MockLinearIssue = {
   priority?: number;
   url?: string;
 };
+
+// --- Sentry mock payload types ---
+
+export type MockSentryOrganization = { id: string; slug: string; name: string };
+
+export type MockSentryProject = { id: string; slug: string; name: string; orgSlug: string };
