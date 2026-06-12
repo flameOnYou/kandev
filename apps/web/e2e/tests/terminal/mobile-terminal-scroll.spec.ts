@@ -10,6 +10,7 @@ import type { SeedData } from "../../fixtures/test-base";
 import type { ApiClient } from "../../helpers/api-client";
 import { SessionPage } from "../../pages/session-page";
 import {
+  focusTerminalForTyping,
   readTerminalBuffer,
   switchToTerminalPanel,
   waitForShellReady,
@@ -41,16 +42,13 @@ async function seedTaskWithSession(
 
 async function readViewportY(page: Page): Promise<number> {
   return page.evaluate(() => {
-    const panel = document.querySelector('[data-testid="terminal-panel"]');
-    const xtermEl = panel?.querySelector(".xterm");
+    const panels = Array.from(document.querySelectorAll('[data-testid="terminal-panel"]'));
+    const visiblePanels = panels.filter((panel) => panel.getClientRects().length > 0);
+    const panel = visiblePanels.at(-1) ?? panels.at(-1);
     type XC = HTMLElement & { __xtermReadViewportY?: () => number };
-    const container = xtermEl?.parentElement as XC | null | undefined;
+    const container = panel?.querySelector('[data-testid="terminal-xterm-host"]') as XC | null;
     return container?.__xtermReadViewportY?.() ?? -1;
   });
-}
-
-async function focusTerminalForTyping(session: SessionPage): Promise<void> {
-  await session.terminal.locator(".xterm").click();
 }
 
 /**
@@ -68,7 +66,10 @@ async function swipe(
   await page.evaluate(
     ({ direction, steps, rowsToScroll }) => {
       const panel = document.querySelector('[data-testid="terminal-panel"]');
-      const xtermEl = panel?.querySelector(".xterm") as HTMLElement | null;
+      // xterm registers touch handling on its generated element, so this test
+      // intentionally locates that implementation node for event dispatch.
+      const xterms = Array.from(panel?.querySelectorAll(".xterm") ?? []);
+      const xtermEl = (panel?.querySelector(".xterm.focus") ?? xterms.at(-1)) as HTMLElement | null;
       if (!xtermEl) throw new Error("xterm element not found");
       const rect = xtermEl.getBoundingClientRect();
       const cx = rect.left + rect.width / 2;
@@ -111,10 +112,10 @@ test.describe("Mobile passthrough terminal — touch scroll", () => {
     seedData,
   }) => {
     test.setTimeout(120_000);
-    const session = await seedTaskWithSession(testPage, apiClient, seedData, "Touch scroll");
+    await seedTaskWithSession(testPage, apiClient, seedData, "Touch scroll");
     await switchToTerminalPanel(testPage);
     await waitForShellReady(testPage);
-    await focusTerminalForTyping(session);
+    await focusTerminalForTyping(testPage);
 
     // Produce enough output to populate the scrollback past one viewport.
     await typeAndRun(testPage, "for i in $(seq 1 200); do echo line $i; done");
