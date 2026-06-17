@@ -4,6 +4,7 @@ export type SidebarWorkspace = {
 };
 
 export const LAST_KANBAN_WORKSPACE_KEY = "kandev.lastKanbanWorkspaceId";
+export const OFFICE_ACTIVE_WORKSPACE_COOKIE = "office-active-workspace";
 
 export function isOfficeWorkspace(workspace: SidebarWorkspace | undefined): boolean {
   return Boolean(workspace?.office_workflow_id);
@@ -18,6 +19,11 @@ export function workspaceHomeHref(workspace: SidebarWorkspace | undefined): stri
 export function rememberLastKanbanWorkspace(workspace: SidebarWorkspace | undefined): void {
   if (!workspace || isOfficeWorkspace(workspace) || typeof window === "undefined") return;
   window.localStorage.setItem(LAST_KANBAN_WORKSPACE_KEY, workspace.id);
+}
+
+export function rememberLastOfficeWorkspace(workspace: SidebarWorkspace | undefined): void {
+  if (!workspace || !isOfficeWorkspace(workspace) || typeof document === "undefined") return;
+  document.cookie = `${OFFICE_ACTIVE_WORKSPACE_COOKIE}=${encodeURIComponent(workspace.id)}; path=/; max-age=86400; samesite=strict; secure`;
 }
 
 export function resolveLastKanbanWorkspace(
@@ -35,8 +41,24 @@ export function resolveLastKanbanWorkspace(
   return kanbanWorkspaces[0] ?? null;
 }
 
-export function resolveFirstOfficeWorkspace(
+export function resolveLastOfficeWorkspace(
   workspaces: SidebarWorkspace[],
 ): SidebarWorkspace | null {
-  return workspaces.find(isOfficeWorkspace) ?? null;
+  const officeWorkspaces = workspaces.filter(isOfficeWorkspace);
+  if (officeWorkspaces.length === 0) return null;
+
+  const storedId =
+    typeof document === "undefined" ? null : readCookieValue(OFFICE_ACTIVE_WORKSPACE_COOKIE);
+  const stored = officeWorkspaces.find((workspace) => workspace.id === storedId);
+  return stored ?? officeWorkspaces[0] ?? null;
+}
+
+function readCookieValue(name: string): string | null {
+  const prefix = `${name}=`;
+  const match = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix));
+  if (!match) return null;
+  return decodeURIComponent(match.slice(prefix.length));
 }

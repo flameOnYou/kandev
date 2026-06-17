@@ -13,6 +13,7 @@ const state = {
     items: [
       { id: "kanban-1", name: "Kanban", office_workflow_id: "" },
       { id: "office-1", name: "Office", office_workflow_id: "wf-office" },
+      { id: "office-2", name: "Office 2", office_workflow_id: "wf-office-2" },
     ],
   },
   appSidebar: { settingsMode: false },
@@ -72,8 +73,14 @@ describe("AppSidebarFooter", () => {
   beforeEach(() => {
     officeEnabled = false;
     state.workspaces.activeId = "kanban-1";
+    state.workspaces.items = [
+      { id: "kanban-1", name: "Kanban", office_workflow_id: "" },
+      { id: "office-1", name: "Office", office_workflow_id: "wf-office" },
+      { id: "office-2", name: "Office 2", office_workflow_id: "wf-office-2" },
+    ];
     state.appSidebar.settingsMode = false;
     window.localStorage.clear();
+    document.cookie = "office-active-workspace=; path=/; max-age=0";
     mocks.routerPush.mockClear();
     mocks.toggleSettingsMode.mockClear();
   });
@@ -109,6 +116,28 @@ describe("AppSidebarFooter", () => {
     expect(window.localStorage.getItem("kandev.lastKanbanWorkspaceId")).toBe("kanban-1");
   });
 
+  it("navigates to the last active office workspace when kanban is active", () => {
+    officeEnabled = true;
+    document.cookie = "office-active-workspace=office-2; path=/";
+
+    renderFooter();
+
+    fireEvent.click(screen.getByRole("button", { name: "Office" }));
+
+    expect(mocks.routerPush).toHaveBeenCalledWith("/office?workspaceId=office-2");
+  });
+
+  it("navigates to office setup when no office workspace exists", () => {
+    officeEnabled = true;
+    state.workspaces.items = [{ id: "kanban-1", name: "Kanban", office_workflow_id: "" }];
+
+    renderFooter();
+
+    fireEvent.click(screen.getByRole("button", { name: "Office" }));
+
+    expect(mocks.routerPush).toHaveBeenCalledWith("/office/setup?mode=new");
+  });
+
   it("shows a Kanban button when an office workspace is active", () => {
     officeEnabled = true;
     state.workspaces.activeId = "office-1";
@@ -119,6 +148,19 @@ describe("AppSidebarFooter", () => {
     expect(screen.queryByRole("button", { name: "Office" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Kanban" }));
 
+    expect(mocks.routerPush).toHaveBeenCalledWith("/?workspaceId=kanban-1");
+  });
+
+  it("remembers the current office workspace when toggling back to kanban", () => {
+    officeEnabled = true;
+    state.workspaces.activeId = "office-2";
+    window.localStorage.setItem("kandev.lastKanbanWorkspaceId", "kanban-1");
+
+    renderFooter();
+
+    fireEvent.click(screen.getByRole("button", { name: "Kanban" }));
+
+    expect(document.cookie).toContain("office-active-workspace=office-2");
     expect(mocks.routerPush).toHaveBeenCalledWith("/?workspaceId=kanban-1");
   });
 });
