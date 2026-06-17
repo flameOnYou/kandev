@@ -12,8 +12,21 @@ type WorkspacesGroupProps = {
   onToggle?: () => void;
 };
 
+function isWorkspaceRoute(pathname: string, workspaceId: string): boolean {
+  const workspacePath = `${ROOT_HREF}/${workspaceId}`;
+  return pathname === workspacePath || pathname.startsWith(`${workspacePath}/`);
+}
+
 export function WorkspacesGroup({ pathname, expanded, onToggle }: WorkspacesGroupProps) {
   const workspaces = useAppStore((s) => s.workspaces.items);
+  const activeWorkspaceId =
+    workspaces.find((workspace) => isWorkspaceRoute(pathname, workspace.id))?.id ?? null;
+  const routeExpansionKey = activeWorkspaceId ?? "all";
+  const hasActiveWorkspaceRoute = activeWorkspaceId !== null;
+
+  function shouldExpandWorkspace(workspaceId: string): boolean {
+    return !hasActiveWorkspaceRoute || activeWorkspaceId === workspaceId;
+  }
 
   return (
     <SettingsGroup
@@ -30,11 +43,11 @@ export function WorkspacesGroup({ pathname, expanded, onToggle }: WorkspacesGrou
         const workflowsPath = `${workspacePath}/workflows`;
         return (
           <SettingsGroup
-            key={workspace.id}
+            key={`${workspace.id}:${routeExpansionKey}`}
             label={workspace.name}
             href={workspacePath}
             isActive={pathname === workspacePath}
-            defaultExpanded={pathname.startsWith(workspacePath)}
+            defaultExpanded={shouldExpandWorkspace(workspace.id)}
             depth={1}
           >
             <SettingsLeaf
