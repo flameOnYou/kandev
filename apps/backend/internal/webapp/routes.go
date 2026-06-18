@@ -127,7 +127,12 @@ func isStaticPath(requestPath string) bool {
 	}
 
 	switch requestPath {
-	case "/favicon.ico", "/robots.txt", "/manifest.json", "/manifest.webmanifest", "/vite.svg":
+	case "/apple-touch-icon.png",
+		"/favicon.ico",
+		"/icon.svg",
+		"/manifest.webmanifest",
+		"/robots.txt",
+		"/vite.svg":
 		return true
 	default:
 		return false

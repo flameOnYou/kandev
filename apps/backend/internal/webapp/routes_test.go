@@ -64,6 +64,8 @@ func TestClassifyRouteNonSPARoutes(t *testing.T) {
 		{name: "health", path: "/health", wantKind: RouteKindHealth},
 		{name: "vite assets", path: "/assets/app.js", wantKind: RouteKindStatic},
 		{name: "favicon", path: "/favicon.ico", wantKind: RouteKindStatic},
+		{name: "svg icon", path: "/icon.svg", wantKind: RouteKindStatic},
+		{name: "apple touch icon", path: "/apple-touch-icon.png", wantKind: RouteKindStatic},
 		{name: "robots", path: "/robots.txt", wantKind: RouteKindStatic},
 		{name: "manifest", path: "/manifest.webmanifest", wantKind: RouteKindStatic},
 		{name: "legacy next static", path: "/_next/static/chunk.js", wantKind: RouteKindStatic},
