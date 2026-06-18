@@ -31,7 +31,7 @@ describe("shouldShowTaskRunningSpinner", () => {
     expect(shouldShowTaskRunningSpinner("TODO")).toBe(false);
   });
 
-  it("returns true when any task state has an actively running primary session", () => {
+  it("returns true for non-TODO task states with an actively running primary session", () => {
     expect(shouldShowTaskRunningSpinner("REVIEW", "RUNNING")).toBe(true);
     expect(shouldShowTaskRunningSpinner("COMPLETED", "RUNNING")).toBe(true);
     expect(shouldShowTaskRunningSpinner("FAILED", "RUNNING")).toBe(true);
@@ -70,5 +70,17 @@ describe("shouldShowTaskRunningSpinner", () => {
     // was torn down (office IDLE). The spinner is misleading.
     expect(shouldShowTaskRunningSpinner("IN_PROGRESS", "WAITING_FOR_INPUT")).toBe(false);
     expect(shouldShowTaskRunningSpinner("IN_PROGRESS", "IDLE")).toBe(false);
+  });
+
+  it("suppresses the spinner for TODO regardless of primary session state", () => {
+    // TODO is the queued/not-started column. A stale primary session state
+    // (e.g. task moved back from IN_PROGRESS with the session still alive)
+    // must not paint the running spinner on the kanban card.
+    expect(shouldShowTaskRunningSpinner("TODO", "RUNNING")).toBe(false);
+    expect(shouldShowTaskRunningSpinner("TODO", "STARTING")).toBe(false);
+    expect(shouldShowTaskRunningSpinner("TODO", "CREATED")).toBe(false);
+    expect(shouldShowTaskRunningSpinner("TODO", "COMPLETED")).toBe(false);
+    expect(shouldShowTaskRunningSpinner("TODO", "WAITING_FOR_INPUT")).toBe(false);
+    expect(shouldShowTaskRunningSpinner("TODO", "IDLE")).toBe(false);
   });
 });
