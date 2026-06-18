@@ -2,6 +2,7 @@ import { test, expect } from "../../fixtures/test-base";
 import { KanbanPage } from "../../pages/kanban-page";
 import { SessionPage } from "../../pages/session-page";
 import type { ApiClient } from "../../helpers/api-client";
+import type { Locator, Page } from "@playwright/test";
 
 const OWNER = "acme";
 const REPO = "demo";
@@ -88,6 +89,37 @@ async function associatePR(
     deletions: 5,
     ...overrides,
   });
+}
+
+function manyRunningChecks(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    name: `E2E Shard ${index + 1}/${count} / run`,
+    status: "in_progress",
+    html_url: `https://example.com/checks/${index + 1}`,
+  }));
+}
+
+async function expectScrollablePopoverWithinViewport(testPage: Page, locator: Locator) {
+  const metrics = await locator.evaluate((node) => {
+    const content = node.classList.contains("overflow-y-auto")
+      ? node
+      : node.closest(".overflow-y-auto");
+    const rect = content?.getBoundingClientRect();
+    return {
+      top: rect?.top ?? -1,
+      bottom: rect?.bottom ?? -1,
+      clientHeight: content?.clientHeight ?? 0,
+      scrollHeight: content?.scrollHeight ?? 0,
+      overflowY: content ? getComputedStyle(content).overflowY : "",
+      overscrollBehavior: content ? getComputedStyle(content).overscrollBehavior : "",
+    };
+  });
+  const viewportHeight = testPage.viewportSize()?.height ?? 0;
+  expect(metrics.top).toBeGreaterThanOrEqual(0);
+  expect(metrics.bottom).toBeLessThanOrEqual(viewportHeight);
+  expect(metrics.overflowY).toBe("auto");
+  expect(metrics.overscrollBehavior).toBe("contain");
+  expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight);
 }
 
 async function openTaskAndWait(
@@ -209,6 +241,44 @@ test.describe("PR top-bar CI popover", () => {
     await expect(session.prWorkflowRow("E2E")).toBeVisible();
     await expect(session.prWorkflowRow("Lint")).toContainText("0/1 passed");
     await expect(session.prWorkflowRow("E2E")).toContainText("4/5 passed");
+  });
+
+  test("desktop CI popovers scroll instead of overflowing the viewport", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    test.setTimeout(120_000);
+    const title = "Many Running Checks";
+    const seed = await seedTask(
+      apiClient,
+      seedData.workspaceId,
+      seedData.agentProfileId,
+      seedData.repositoryId,
+      title,
+    );
+    await associatePR(apiClient, seed.taskId, {
+      checks_state: "pending",
+      checks_total: 30,
+      checks_passing: 0,
+    });
+    await apiClient.mockGitHubSeedPRFeedback({
+      owner: OWNER,
+      repo: REPO,
+      pr_number: PR_NUMBER,
+      checks: manyRunningChecks(30),
+    });
+    const session = await openTaskAndWait(testPage, apiClient, seed, title);
+
+    await expect(session.prStatusChip()).toBeVisible();
+    await session.prStatusChip().hover();
+    const popoverInner = testPage.getByTestId("pr-topbar-popover-inner");
+    await expect(popoverInner).toBeVisible({ timeout: 10_000 });
+    await expectScrollablePopoverWithinViewport(testPage, popoverInner);
+
+    await testPage.mouse.move(0, 0);
+    await session.hoverPRTopbar();
+    await expectScrollablePopoverWithinViewport(testPage, session.prTopbarPopover());
   });
 
   test("review row shows N / M required + unresolved comments count", async ({
