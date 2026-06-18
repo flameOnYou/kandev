@@ -12,7 +12,7 @@ flowchart TB
 
     run --> resolve["Resolve installed runtime"]
     dev --> makedev["make dev"]
-    start --> binary["Local binary + next start"]
+    start --> binary["Local binary<br/>(embedded Vite assets)"]
 
     resolve --> envvar["KANDEV_BUNDLE_DIR<br/>(Homebrew, tests)"]
     resolve --> npmpkg["@kdlbs/runtime-{platform}<br/>(npm/npx)"]
@@ -26,7 +26,7 @@ flowchart TB
 
     subgraph supervisor["Process Supervisor"]
         direction LR
-        s1["Manages backend + web processes"]
+        s1["Manages backend process"]
         s2["Handles graceful shutdown"]
         s3["Forwards signals"]
     end
@@ -34,7 +34,7 @@ flowchart TB
 
 ## Overview
 
-The Kandev CLI (`kandev`) is the primary way to run the Kandev application. It launches the backend and web processes from an installed runtime bundle and provides a unified interface for end users and developers.
+The Kandev CLI (`kandev`) is the primary way to run the Kandev application. It launches the backend from an installed runtime bundle; the backend serves the web assets, API, and WebSocket gateway.
 
 ## Installation
 
@@ -107,11 +107,12 @@ kandev dev
 **What happens:**
 1. Locates the repo root (looks for `apps/backend` and `apps/web`).
 2. Runs `make dev` for the backend (Go with hot-reload).
-3. Runs `pnpm dev` for the web app (Next.js dev server).
+3. Runs `pnpm dev` for the web app (Vite dev server).
 
 ### `kandev start`
 
-Runs the application using local production builds. Requires running `make build` first.
+Runs the application using the local production backend binary. Requires running
+`make build` first so the Vite SPA is embedded into that binary.
 
 ```bash
 make build
@@ -124,7 +125,7 @@ kandev start
 |--------|-------------|---------|
 | `--version`, `-V` | Print CLI version and exit | `kandev --version` |
 | `--port <port>` | Backend port (alias: `--backend-port`) | `--port 3000` |
-| `--web-internal-port <port>` | Override internal Next.js port | `--web-internal-port 13000` |
+| `--web-internal-port <port>` | Override internal web app port | `--web-internal-port 13000` |
 | `--verbose`, `-v` | Show info logs from backend + web | `--verbose` |
 | `--debug` | Show debug logs + agent message dumps | `--debug` |
 | `--help`, `-h` | Show help | `--help` |
@@ -164,7 +165,7 @@ If the default port is in use, the CLI finds the next available port automatical
 |----------|-------------|
 | `KANDEV_BUNDLE_DIR` | Force the runtime bundle location (set by Homebrew wrapper) |
 | `KANDEV_PORT` / `KANDEV_BACKEND_PORT` | Backend port (CLI flag wins) |
-| `KANDEV_WEB_PORT` | Internal Next.js port |
+| `KANDEV_WEB_PORT` | Internal web app port |
 | `KANDEV_HEALTH_TIMEOUT_MS` | Override health check timeout (ms) |
 | `KANDEV_GITHUB_OWNER` / `KANDEV_GITHUB_REPO` | Override GitHub repo for `--runtime-version` downloads |
 | `KANDEV_GITHUB_TOKEN` | GitHub token for `--runtime-version` API access |

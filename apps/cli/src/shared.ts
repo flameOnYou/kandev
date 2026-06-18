@@ -43,6 +43,8 @@ export type BackendEnvOptions = {
   ports: PortConfig;
   /** Log level: debug, info, warn, error (default: info) */
   logLevel?: string;
+  /** Route browser pages through an external dev web server. Production serves the SPA from Go. */
+  webProxy?: boolean;
   /** Additional environment variables to merge */
   extra?: Record<string, string>;
 };
@@ -54,22 +56,26 @@ export type BackendEnvOptions = {
  * @returns Environment object for the backend process
  */
 export function buildBackendEnv(options: BackendEnvOptions): NodeJS.ProcessEnv {
-  const { ports, logLevel, extra } = options;
-  return {
+  const { ports, logLevel, webProxy = true, extra } = options;
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     KANDEV_SERVER_PORT: String(ports.backendPort),
-    KANDEV_WEB_INTERNAL_URL: `http://localhost:${ports.webPort}`,
+    ...(webProxy ? { KANDEV_WEB_INTERNAL_URL: `http://localhost:${ports.webPort}` } : {}),
     KANDEV_AGENT_STANDALONE_PORT: String(ports.agentctlPort),
     ...(logLevel ? { KANDEV_LOG_LEVEL: logLevel } : {}),
     ...extra,
   };
+  if (!webProxy) {
+    delete env.KANDEV_WEB_INTERNAL_URL;
+  }
+  return env;
 }
 
 export type WebEnvOptions = {
   ports: PortConfig;
   /** Set NODE_ENV to production */
   production?: boolean;
-  /** Enable debug mode (NEXT_PUBLIC_KANDEV_DEBUG) */
+  /** Enable debug mode */
   debug?: boolean;
 };
 
@@ -84,45 +90,24 @@ export function buildWebEnv(options: WebEnvOptions): NodeJS.ProcessEnv {
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    // Server-side: full localhost URL for SSR fetches (Next.js SSR → Go backend)
+    // Internal Vite/server tooling config. Browser traffic enters through Go
+    // in every mode so frontend code should use same-origin API/WS URLs.
     KANDEV_API_BASE_URL: ports.backendUrl,
     PORT: String(ports.webPort),
-    // Ensure Next.js standalone server binds to 127.0.0.1 so localhost health checks work.
-    // Without this, HOSTNAME from the host environment can cause binding issues.
     HOSTNAME: "127.0.0.1",
   };
 
   if (production) {
     (env as Record<string, string>).NODE_ENV = "production";
-    // Explicitly unset so a host-level NEXT_PUBLIC_KANDEV_API_PORT (from a .env
-    // file, Docker env, or CI variable) cannot leak through the process.env
-    // spread above and reintroduce the cross-origin URL problem.
-    delete env.NEXT_PUBLIC_KANDEV_API_PORT;
-  } else {
-    // Dev mode only: browser hits the web port directly, so the client needs to
-    // know the backend port for API calls. In production the Go backend
-    // reverse-proxies Next.js on a single port, so the client uses same-origin
-    // and this var must NOT be set — otherwise the client builds cross-origin
-    // URLs like `https://host:38429/...` that aren't reachable behind a
-    // reverse proxy / ingress / Cloudflare tunnel.
-    env.NEXT_PUBLIC_KANDEV_API_PORT = String(ports.backendPort);
-
-    // Auto-allow the host's own LAN / VPN addresses so a dev hitting the dev
-    // server from another device on the same network (Tailscale, LAN IP, WSL
-    // mirrored mode, etc.) passes Next.js's allowedDevOrigins check and HMR
-    // works. The user can still extend the list via NEXT_ALLOWED_DEV_ORIGINS.
-    // Skip the assignment when there's nothing to add — keeps the env clean
-    // for the loopback-only case.
-    const merged = mergeAllowedDevOrigins(
-      process.env.NEXT_ALLOWED_DEV_ORIGINS,
-      listHostNetworkAddresses(),
-    );
-    if (merged) env.NEXT_ALLOWED_DEV_ORIGINS = merged;
   }
+  // Explicitly unset so a host-level VITE_KANDEV_API_PORT (from a .env file,
+  // Docker env, or CI variable) cannot leak through the process.env spread and
+  // reintroduce cross-origin browser API calls.
+  delete env.VITE_KANDEV_API_PORT;
 
   if (debug) {
     env.KANDEV_DEBUG = "true";
-    env.NEXT_PUBLIC_KANDEV_DEBUG = "true";
+    env.VITE_KANDEV_DEBUG = "true";
   }
 
   return env;
@@ -130,8 +115,7 @@ export function buildWebEnv(options: WebEnvOptions): NodeJS.ProcessEnv {
 
 /**
  * Returns the host's non-loopback, non-internal IPv4/IPv6 addresses. Used to
- * auto-populate Next.js `allowedDevOrigins` so the dev server accepts
- * connections from LAN / Tailscale / SSH-forwarded clients.
+ * print LAN / Tailscale / SSH-forwarded browser URLs in the startup banner.
  */
 export function listHostNetworkAddresses(): string[] {
   const v4: string[] = [];
@@ -160,27 +144,15 @@ export function listHostNetworkAddresses(): string[] {
   return [...v4, ...v6];
 }
 
-function mergeAllowedDevOrigins(existing: string | undefined, extra: string[]): string {
-  const set = new Set<string>();
-  if (existing) {
-    for (const s of existing.split(",")) {
-      const trimmed = s.trim();
-      if (trimmed) set.add(trimmed);
-    }
-  }
-  for (const s of extra) set.add(s);
-  return [...set].join(",");
-}
-
 export type StartupInfoOptions = {
   /** Mode header line, e.g. "dev mode: using local repo" or "release: v0.0.12 (github latest)" */
   header: string;
   ports: PortConfig;
   /**
-   * Which port a user actually opens in a browser. In `start`/`run` the Go
-   * backend reverse-proxies Next.js so the entry point is the backend port;
-   * in `dev` the browser hits Next.js directly. Network URLs are only listed
-   * under this port — the other one is internal-only. Defaults to "backend".
+   * Which port a user actually opens in a browser. Normal `dev`/`start`/`run`
+   * use the Go backend as the entrypoint; `primary: "web"` is retained for
+   * diagnostics. Network URLs are only listed under this port — the other one
+   * is internal-only. Defaults to "backend".
    */
   primary?: "backend" | "web";
   /** Database file path */
@@ -192,12 +164,10 @@ export type StartupInfoOptions = {
 /**
  * Logs a unified startup info block to the console.
  *
- * Shows only the URL the user actually opens — start/run modes have the Go
- * backend reverse-proxy Next.js on a single port, dev mode hits Next.js
- * directly. The other port and the agentctl port are internal plumbing and
- * would only mislead. Below the URL, lists the same port on each non-loopback
- * interface (LAN, Tailscale) so a user opening the app remotely sees the
- * right address.
+ * Shows only the URL the user actually opens. The other web/Vite port and the
+ * agentctl port are internal plumbing and would only mislead. Below the URL,
+ * lists the same port on each non-loopback interface (LAN, Tailscale) so a
+ * user opening the app remotely sees the right address.
  */
 export function logStartupInfo(options: StartupInfoOptions): void {
   const { header, ports, primary = "backend", dbPath, logLevel } = options;

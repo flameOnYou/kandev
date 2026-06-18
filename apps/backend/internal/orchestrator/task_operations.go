@@ -47,6 +47,11 @@ var ErrSessionResetInProgress = errors.New("session reset in progress")
 // the two misleads the UI and any caller doing errors.Is checks.
 var ErrSessionNotPromptable = errors.New("session not promptable")
 
+const (
+	agentPromptReadyTimeout  = 10 * time.Second
+	agentPromptReadyInterval = 100 * time.Millisecond
+)
+
 func isAgentPromptInProgressError(err error) bool {
 	return err != nil && errors.Is(err, ErrAgentPromptInProgress)
 }
@@ -298,6 +303,7 @@ func (s *Service) StartCreatedSession(ctx context.Context, taskID, sessionID, ag
 				"model":      profileInfo.Model,
 			}
 		}
+		s.promoteSessionIfTaskHasNoPrimary(ctx, taskID, session)
 		if err := s.repo.UpdateTaskSession(ctx, session); err != nil {
 			s.logger.Warn("failed to update session agent profile",
 				zap.String("session_id", sessionID),
@@ -398,6 +404,33 @@ func (s *Service) StartCreatedSession(ctx context.Context, taskID, sessionID, ag
 	go s.ensureSessionPRWatch(context.Background(), taskID, execution.SessionID, execution.WorktreeBranch)
 
 	return execution, nil
+}
+
+func (s *Service) promoteSessionIfTaskHasNoPrimary(ctx context.Context, taskID string, session *models.TaskSession) {
+	if session == nil || session.IsPrimary {
+		return
+	}
+	sessions, err := s.repo.ListTaskSessions(ctx, taskID)
+	if err != nil {
+		s.logger.Warn("failed to inspect task sessions for missing primary",
+			zap.String("task_id", taskID),
+			zap.String("session_id", session.ID),
+			zap.Error(err))
+		return
+	}
+	for _, existing := range sessions {
+		if existing.IsPrimary {
+			return
+		}
+	}
+	if err := s.SetPrimarySession(ctx, session.ID); err != nil {
+		s.logger.Warn("failed to promote workflow session as primary",
+			zap.String("task_id", taskID),
+			zap.String("session_id", session.ID),
+			zap.Error(err))
+		return
+	}
+	session.IsPrimary = true
 }
 
 // postLaunchCreated handles post-launch bookkeeping for a created session:
@@ -975,7 +1008,11 @@ func (s *Service) ResumeTaskSession(ctx context.Context, taskID, sessionID strin
 		// If the execution is already running (duplicate resume request), return it as success.
 		if errors.Is(err, executor.ErrExecutionAlreadyRunning) {
 			if existing, ok := s.executor.GetExecutionBySession(sessionID); ok && existing != nil {
-				existing.SessionState = v1.TaskSessionState(session.State)
+				readySession, waitErr := s.waitForResumedSessionReady(ctx, sessionID)
+				if waitErr != nil {
+					return nil, waitErr
+				}
+				existing.SessionState = v1.TaskSessionState(readySession.State)
 				return existing, nil
 			}
 		}
@@ -1003,8 +1040,11 @@ func (s *Service) ResumeTaskSession(ctx context.Context, taskID, sessionID strin
 		}
 		return nil, err
 	}
-	// Preserve persisted task/session state; resume should not mutate state/columns.
-	execution.SessionState = v1.TaskSessionState(session.State)
+	readySession, err := s.waitForResumedSessionReady(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	execution.SessionState = v1.TaskSessionState(readySession.State)
 
 	// Backfill the initial user message when a prior failed launch never got
 	// to recordInitialMessage. Without this, the resume can succeed and the
@@ -1033,6 +1073,38 @@ func (s *Service) ResumeTaskSession(ctx context.Context, taskID, sessionID strin
 	go s.ensureSessionPRWatch(context.Background(), taskID, execution.SessionID, execution.WorktreeBranch)
 
 	return execution, nil
+}
+
+func (s *Service) waitForResumedSessionReady(ctx context.Context, sessionID string) (*models.TaskSession, error) {
+	return s.waitForSessionAndAgentReady(ctx, sessionID, "after resume")
+}
+
+func (s *Service) waitForSessionAndAgentReady(ctx context.Context, sessionID, waitContext string) (*models.TaskSession, error) {
+	if err := s.waitForSessionReady(ctx, sessionID); err != nil {
+		return nil, fmt.Errorf("session not ready %s: %w", waitContext, err)
+	}
+	if err := s.waitForAgentPromptReady(ctx, sessionID); err != nil {
+		return nil, fmt.Errorf("agent not ready %s: %w", waitContext, err)
+	}
+	session, err := s.repo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reload session %s: %w", waitContext, err)
+	}
+	return session, nil
+}
+
+func (s *Service) waitForStartingSessionPromptable(ctx context.Context, taskID, sessionID string) (*models.TaskSession, error) {
+	s.logger.Debug("waiting for starting session to become promptable",
+		zap.String("task_id", taskID),
+		zap.String("session_id", sessionID))
+	session, err := s.waitForSessionAndAgentReady(ctx, sessionID, "for prompt")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkSessionPromptable(taskID, sessionID, session.State); err != nil {
+		return nil, err
+	}
+	return session, nil
 }
 
 // StartSessionForWorkflowStep starts an existing session with a workflow step's prompt configuration.
@@ -1125,6 +1197,9 @@ func (s *Service) advanceTaskWorkflowStep(ctx context.Context, task *models.Task
 func (s *Service) ensureSessionRunning(ctx context.Context, sessionID string, session *models.TaskSession) error {
 	// Check if agent is genuinely running (in-memory execution store, not just DB state)
 	if exec, ok := s.executor.GetExecutionBySession(sessionID); ok && exec != nil {
+		if err := s.waitForAgentPromptReady(ctx, sessionID); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -1177,9 +1252,36 @@ func (s *Service) ensureSessionRunning(ctx context.Context, sessionID string, se
 	if err := s.waitForSessionReady(ctx, sessionID); err != nil {
 		return fmt.Errorf("session not ready after resume: %w", err)
 	}
+	if err := s.waitForAgentPromptReady(ctx, sessionID); err != nil {
+		return fmt.Errorf("agent not ready after resume: %w", err)
+	}
 
 	s.logger.Debug("session resumed and ready for prompt")
 	return nil
+}
+
+func (s *Service) waitForAgentPromptReady(ctx context.Context, sessionID string) error {
+	if s.agentManager == nil {
+		return nil
+	}
+
+	readyCtx, cancel := context.WithTimeout(ctx, agentPromptReadyTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(agentPromptReadyInterval)
+	defer ticker.Stop()
+
+	for {
+		if s.agentManager.IsAgentReadyForPrompt(readyCtx, sessionID) {
+			return nil
+		}
+
+		select {
+		case <-readyCtx.Done():
+			return fmt.Errorf("agent not ready for prompt: %w", readyCtx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // startAgentOnPreparedWorkspace starts the agent subprocess on a session whose workspace
@@ -1209,6 +1311,9 @@ func (s *Service) startAgentOnPreparedWorkspace(ctx context.Context, sessionID s
 
 	if err := s.waitForSessionReady(ctx, sessionID); err != nil {
 		return fmt.Errorf("session not ready after starting agent: %w", err)
+	}
+	if err := s.waitForAgentPromptReady(ctx, sessionID); err != nil {
+		return fmt.Errorf("agent not ready after starting agent: %w", err)
 	}
 	s.logger.Debug("agent started on prepared workspace and ready for prompt")
 	return nil
@@ -1967,7 +2072,14 @@ func (s *Service) PromptTask(ctx context.Context, taskID, sessionID string, prom
 		return nil, fmt.Errorf("failed to get session: %w", err)
 	}
 	if err := s.checkSessionPromptable(taskID, sessionID, session.State); err != nil {
-		return nil, err
+		if !errors.Is(err, ErrSessionNotPromptable) || session.State != models.TaskSessionStateStarting {
+			return nil, err
+		}
+		readySession, waitErr := s.waitForStartingSessionPromptable(ctx, taskID, sessionID)
+		if waitErr != nil {
+			return nil, waitErr
+		}
+		session = readySession
 	}
 
 	// Inject config context for config-mode sessions (dedicated settings chat, not plan mode)

@@ -1,4 +1,3 @@
-import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
 import { StateProvider } from "@/components/state-provider";
@@ -19,12 +18,12 @@ import { SidebarViewsSyncBridge } from "@/components/sidebar-views-sync-bridge";
 import { LogBufferBridge } from "@/components/log-buffer-bridge";
 import { getFeatureFlagsAction, getRuntimeDebugModeAction } from "@/app/actions/features";
 
-export const metadata: Metadata = {
+export const metadata = {
   title: "Kandev - AI Kanban",
   description: "AI-powered workflow management for developers",
 };
 
-export const viewport: Viewport = {
+export const viewport = {
   // Enable safe area insets for iOS devices (notch, home indicator)
   viewportFit: "cover",
   // Prevent iOS auto-zoom on input focus (for app-like experience)
@@ -37,12 +36,7 @@ export default async function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  // API port injection for dev mode (browser opens at web port, API on backend port).
-  // In production single-port mode, this is not needed — the client uses
-  // window.location.origin (same-origin, works for any domain / reverse proxy).
-  const apiPort = process.env.NEXT_PUBLIC_KANDEV_API_PORT ?? null;
-  const envDebugMode =
-    process.env.KANDEV_DEBUG === "true" || process.env.NEXT_PUBLIC_KANDEV_DEBUG === "true";
+  const envDebugMode = process.env.KANDEV_DEBUG === "true";
 
   // SSR-fetch the deployment's feature flags so the entire client tree
   // (including the sidebar nav and gated routes) renders with the correct
@@ -54,21 +48,13 @@ export default async function RootLayout({
   ]);
   const debugMode = envDebugMode || runtimeDebugMode;
 
-  const runtimeConfigScript =
-    apiPort || debugMode
-      ? [
-          apiPort ? `window.__KANDEV_API_PORT = ${JSON.stringify(apiPort)};` : "",
-          debugMode ? `window.__KANDEV_DEBUG = true;` : "",
-        ]
-          .filter(Boolean)
-          .join("\n")
-      : null;
+  const runtimeConfigScript = debugMode ? "window.__KANDEV_DEBUG = true;" : null;
 
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
         <meta name="apple-mobile-web-app-title" content="Kandev" />
-        {/* Inject runtime config before Next.js async chunks so debug UI flags
+        {/* Inject runtime config before app chunks so debug UI flags
             are visible when client modules first evaluate. */}
         {runtimeConfigScript ? (
           <script dangerouslySetInnerHTML={{ __html: runtimeConfigScript }} />

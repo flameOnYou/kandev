@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 const navigationMock = vi.hoisted(() => ({ push: vi.fn() }));
 
-vi.mock("next/navigation", () => ({
+vi.mock("@/lib/routing/client-router", () => ({
   useRouter: () => ({ push: navigationMock.push }),
 }));
 
@@ -174,6 +174,7 @@ describe("AppSidebarWorkspacePicker — workspace select", () => {
 
     fireEvent.click(screen.getByTestId(KANBAN_WORKSPACE_ITEM));
 
+    expect(cookieWrites.some((c) => c.startsWith("office-active-workspace=w2"))).toBe(true);
     expect(storeState.setActiveWorkspace).toHaveBeenCalledWith("w1");
     expect(navigationMock.push).toHaveBeenCalledWith("/?workspaceId=w1");
   });

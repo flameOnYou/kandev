@@ -1,6 +1,6 @@
 "use client";
 
-import { usePathname } from "next/navigation";
+import { usePathname } from "@/lib/routing/client-router";
 
 const PAGE_TITLES: Record<string, string> = {
   "/office": "Dashboard",
@@ -27,7 +27,7 @@ function resolveTitle(pathname: string): string | null {
 function isDetailPage(pathname: string): boolean {
   return (
     /^\/office\/tasks\/[^/]+$/.test(pathname) ||
-    /^\/office\/agents\/[^/]+$/.test(pathname) ||
+    /^\/office\/agents\/[^/]+(?:\/.*)?$/.test(pathname) ||
     /^\/office\/projects\/[^/]+$/.test(pathname) ||
     /^\/office\/routines\/[^/]+$/.test(pathname)
   );

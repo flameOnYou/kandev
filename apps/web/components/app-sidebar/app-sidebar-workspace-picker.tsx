@@ -1,7 +1,7 @@
 "use client";
 
 import { forwardRef, useCallback, useState, type ComponentPropsWithoutRef } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "@/lib/routing/client-router";
 import {
   IconBriefcase,
   IconCheck,
@@ -97,6 +97,9 @@ export function AppSidebarWorkspacePicker() {
         return;
       }
       const type = workspaceType(workspace);
+      if (workspaceType(activeWorkspace) === "office" && type !== "office") {
+        rememberLastOfficeWorkspace(activeWorkspace);
+      }
       if (type === "office") {
         rememberLastOfficeWorkspace(workspace);
       }
@@ -108,7 +111,7 @@ export function AppSidebarWorkspacePicker() {
       }
       setOpen(false);
     },
-    [activeId, router, setActiveWorkspace, officeEnabled],
+    [activeId, activeWorkspace, router, setActiveWorkspace, officeEnabled],
   );
 
   return (

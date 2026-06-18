@@ -20,6 +20,7 @@ import (
 	"github.com/kandev/kandev/internal/orchestrator/scheduler"
 	"github.com/kandev/kandev/internal/sysprompt"
 	"github.com/kandev/kandev/internal/task/models"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
 	v1 "github.com/kandev/kandev/pkg/api/v1"
 )
 
@@ -80,6 +81,116 @@ func TestPromptTask_SessionAlreadyRunning(t *testing.T) {
 	_, err := svc.PromptTask(context.Background(), "task1", "session1", "hello", "", false, nil, false)
 	if err == nil {
 		t.Fatal("expected error when session is already RUNNING")
+	}
+}
+
+func TestPromptTask_WaitsForStartingSessionBeforePrompt(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedTaskAndSession(t, repo, "task1", "session1", models.TaskSessionStateStarting)
+
+	session, err := repo.GetTaskSession(ctx, "session1")
+	if err != nil {
+		t.Fatalf("failed to load session: %v", err)
+	}
+	session.AgentExecutionID = "exec-resumed-1"
+	session.AgentProfileID = "profile1"
+	if err := repo.UpdateTaskSession(ctx, session); err != nil {
+		t.Fatalf("failed to update session: %v", err)
+	}
+	seedExecutorRunning(t, repo, session.ID, session.TaskID, "exec-resumed-1")
+
+	promptReady := make(chan struct{})
+	readinessChecked := make(chan struct{}, 1)
+	agentMgr := &mockAgentManager{
+		isAgentRunning:         true,
+		repoForExecutionLookup: repo,
+		promptResult: &executor.PromptResult{
+			StopReason:   "end_turn",
+			AgentMessage: "simple mock response",
+		},
+		isAgentReadyFn: func(_ context.Context, _ string) bool {
+			select {
+			case readinessChecked <- struct{}{}:
+			default:
+			}
+			select {
+			case <-promptReady:
+				return true
+			default:
+				return false
+			}
+		},
+	}
+	taskRepo := newMockTaskRepo()
+	taskRepo.tasks["task1"] = &v1.Task{ID: "task1", State: v1.TaskStateInProgress}
+	svc := createTestServiceWithAgent(repo, newMockStepGetter(), taskRepo, agentMgr)
+	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
+
+	done := make(chan struct {
+		result *PromptResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := svc.PromptTask(ctx, "task1", "session1", "/e2e:simple-message", "", false, nil, false)
+		done <- struct {
+			result *PromptResult
+			err    error
+		}{result: result, err: err}
+	}()
+
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		readySession, err := repo.GetTaskSession(context.Background(), "session1")
+		if err != nil || readySession == nil {
+			return
+		}
+		readySession.State = models.TaskSessionStateWaitingForInput
+		readySession.UpdatedAt = time.Now().UTC()
+		_ = repo.UpdateTaskSession(context.Background(), readySession)
+	}()
+
+	select {
+	case <-readinessChecked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected PromptTask to wait for agent prompt readiness")
+	}
+
+	select {
+	case result := <-done:
+		t.Fatalf("PromptTask returned before prompt readiness: result=%#v err=%v", result.result, result.err)
+	default:
+	}
+
+	close(promptReady)
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("PromptTask failed after prompt readiness: %v", result.err)
+		}
+		if result.result == nil {
+			t.Fatal("PromptTask returned nil result")
+		}
+		if result.result.AgentMessage != "simple mock response" {
+			t.Fatalf("unexpected agent message: %q", result.result.AgentMessage)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("PromptTask did not return after prompt readiness")
+	}
+
+	agentMgr.mu.Lock()
+	prompts := append([]string(nil), agentMgr.capturedPrompts...)
+	calls := append([]promptCall(nil), agentMgr.capturedPromptCalls...)
+	agentMgr.mu.Unlock()
+	if len(prompts) != 1 {
+		t.Fatalf("expected one prompt after readiness, got %d", len(prompts))
+	}
+	if prompts[0] != "/e2e:simple-message" {
+		t.Fatalf("unexpected prompt: %q", prompts[0])
+	}
+	if len(calls) != 1 || calls[0].ExecutionID != "exec-resumed-1" {
+		t.Fatalf("unexpected prompt calls: %#v", calls)
 	}
 }
 
@@ -549,6 +660,97 @@ func TestStartCreatedSession_NotInCreatedState(t *testing.T) {
 	_, err := svc.StartCreatedSession(context.Background(), "task1", "session1", "profile1", "prompt", false, false, false, nil)
 	if err == nil {
 		t.Fatal("expected error when session is not in CREATED state")
+	}
+}
+
+func TestStartCreatedSession_WorkflowOverridePromotesPreparedWhenTaskHasNoPrimary(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	now := time.Now().UTC()
+
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws1", Name: "Test", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf1", WorkspaceID: "ws1", Name: "Workflow", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+	if err := repo.CreateTask(ctx, &models.Task{
+		ID:             "task1",
+		WorkspaceID:    "ws1",
+		WorkflowID:     "wf1",
+		WorkflowStepID: "step1",
+		Title:          "Task",
+		Description:    "desc",
+		State:          v1.TaskStateInProgress,
+		Metadata:       map[string]interface{}{models.MetaKeyAgentProfileID: "profile-a"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	stepGetter := newMockStepGetter()
+	stepGetter.steps["step1"] = &wfmodels.WorkflowStep{
+		ID:             "step1",
+		WorkflowID:     "wf1",
+		Name:           "Step 1",
+		AgentProfileID: "profile-b",
+	}
+	taskRepo := newMockTaskRepo()
+	taskRepo.tasks["task1"] = &v1.Task{
+		ID:          "task1",
+		WorkspaceID: "ws1",
+		WorkflowID:  "wf1",
+		Title:       "Task",
+		Description: "desc",
+		State:       v1.TaskStateInProgress,
+		Metadata:    map[string]interface{}{models.MetaKeyAgentProfileID: "profile-a"},
+	}
+
+	var launchedProfile string
+	agentMgr := &mockAgentManager{
+		launchAgentFunc: func(_ context.Context, req *executor.LaunchAgentRequest) (*executor.LaunchAgentResponse, error) {
+			launchedProfile = req.AgentProfileID
+			return &executor.LaunchAgentResponse{AgentExecutionID: "exec-1"}, nil
+		},
+	}
+	svc := createTestServiceWithScheduler(repo, stepGetter, taskRepo, agentMgr)
+
+	sessionID, err := svc.PrepareTaskSession(ctx, "task1", "profile-a", "", "", "step1", false)
+	if err != nil {
+		t.Fatalf("PrepareTaskSession: %v", err)
+	}
+	prepared, err := repo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetTaskSession after prepare: %v", err)
+	}
+	if !prepared.IsPrimary {
+		t.Fatal("prepared first session should start as primary")
+	}
+	prepared.IsPrimary = false
+	if err := repo.UpdateTaskSession(ctx, prepared); err != nil {
+		t.Fatalf("clear prepared primary flag: %v", err)
+	}
+
+	if _, err := svc.StartCreatedSession(ctx, "task1", sessionID, "profile-a", "desc", true, false, true, nil); err != nil {
+		t.Fatalf("StartCreatedSession: %v", err)
+	}
+
+	updated, err := repo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetTaskSession after start: %v", err)
+	}
+	if updated.AgentProfileID != "profile-b" {
+		t.Fatalf("agent profile = %q, want profile-b", updated.AgentProfileID)
+	}
+	if !updated.IsPrimary {
+		t.Fatal("workflow profile override must promote prepared session when task has no primary")
+	}
+	if got := updated.Metadata[models.SessionMetaKeyCreatedBy]; got != models.SessionCreatedByWorkflowSwitch {
+		t.Fatalf("created_by metadata = %v, want %q", got, models.SessionCreatedByWorkflowSwitch)
+	}
+	if launchedProfile != "profile-b" {
+		t.Fatalf("launched profile = %q, want profile-b", launchedProfile)
 	}
 }
 
@@ -1125,13 +1327,20 @@ func TestResumeTaskSession_FailedKeepsResumeToken(t *testing.T) {
 
 	// Agent launch succeeds so the resume path does not unwind and mark the task
 	// FAILED, which would exercise a separate state-mutation code path.
-	agentMgr := &mockAgentManager{
-		launchAgentFunc: func(_ context.Context, _ *executor.LaunchAgentRequest) (*executor.LaunchAgentResponse, error) {
-			return &executor.LaunchAgentResponse{
-				AgentExecutionID: "exec-new",
-				Status:           v1.AgentStatusStarting,
-			}, nil
+	startAgentProcessCalled := false
+	agentMgr := &sessionUpdatingAgentManager{
+		mockAgentManager: &mockAgentManager{
+			launchAgentFunc: func(_ context.Context, _ *executor.LaunchAgentRequest) (*executor.LaunchAgentResponse, error) {
+				return &executor.LaunchAgentResponse{
+					AgentExecutionID: "exec-new",
+					Status:           v1.AgentStatusStarting,
+				}, nil
+			},
 		},
+		repo:          repo,
+		sessionID:     "session1",
+		taskID:        "task1",
+		onStartCalled: &startAgentProcessCalled,
 	}
 	svc := createTestServiceWithAgent(repo, newMockStepGetter(), taskRepo, agentMgr)
 	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})

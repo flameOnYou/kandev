@@ -42,7 +42,7 @@ vi.mock("@/hooks/use-quick-chat-launcher", () => ({
 vi.mock("@/hooks/domains/features/use-feature", () => ({
   useFeature: () => officeEnabled,
 }));
-vi.mock("next/navigation", () => ({
+vi.mock("@/lib/routing/client-router", () => ({
   useRouter: () => ({ push: mocks.routerPush }),
   usePathname: () => pathname,
 }));
@@ -124,7 +124,7 @@ describe("AppSidebarNewTaskItem dialog routing", () => {
     officeEnabled = true;
     pathname = "/office";
     renderItem(false);
-    // NewTaskDialog is lazy-loaded (next/dynamic), so it resolves asynchronously.
+    // NewTaskDialog is lazy-loaded by the SPA dynamic adapter, so it resolves asynchronously.
     expect(await screen.findByTestId(OFFICE_DIALOG_TESTID)).toBeTruthy();
     expect(screen.queryByTestId(REGULAR_DIALOG_TESTID)).toBeNull();
   });
