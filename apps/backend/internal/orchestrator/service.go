@@ -960,7 +960,8 @@ func (s *Service) Stop() error {
 //
 // Strategy:
 //
-//  1. Terminal states (Completed/Cancelled/Failed) → clean up executor record
+//  1. Terminal states (Completed/Cancelled/Failed) → stop any persisted runtime handle,
+//     then clean up executor record only after a confirmed stop
 //  2. Never-started (Created) → clean up executor record
 //  3. Active states (Starting/Running/WaitingForInput) → set session to WAITING_FOR_INPUT,
 //     clear stale execution IDs, fix task state, preserve ExecutorRunning record
@@ -1009,7 +1010,11 @@ func (s *Service) reconcileOneSessionOnStartup(ctx context.Context, running *mod
 
 	session, err := s.repo.GetTaskSession(ctx, sessionID)
 	if err != nil {
-		s.logger.Warn("failed to load session for reconciliation",
+		if isTaskSessionNotFound(err) {
+			s.handleMissingSessionOnStartup(ctx, running)
+			return
+		}
+		s.logger.Warn("failed to load session for reconciliation; preserving executor record",
 			zap.String("session_id", sessionID),
 			zap.Error(err))
 		return
@@ -1092,16 +1097,55 @@ func (s *Service) reconcileOneSessionOnStartup(ctx context.Context, running *mod
 		zap.Bool("has_worktree", running.WorktreePath != ""))
 }
 
+func (s *Service) handleMissingSessionOnStartup(ctx context.Context, running *models.ExecutorRunning) {
+	sessionID := running.SessionID
+	executionID := strings.TrimSpace(running.AgentExecutionID)
+	if executionID == "" || s.agentManager == nil {
+		s.logger.Warn("executor record has no session and no stoppable runtime handle; preserving record",
+			zap.String("session_id", sessionID),
+			zap.String("task_id", running.TaskID))
+		return
+	}
+	if err := s.agentManager.StopAgentWithReason(ctx, executionID, "startup missing session cleanup", true); err != nil {
+		s.logger.Warn("failed to stop missing-session runtime; preserving executor record",
+			zap.String("session_id", sessionID),
+			zap.String("task_id", running.TaskID),
+			zap.String("execution_id", executionID),
+			zap.Error(err))
+		return
+	}
+	if err := s.repo.DeleteExecutorRunningBySessionID(ctx, sessionID); err != nil {
+		s.logger.Warn("failed to remove executor record for missing session",
+			zap.String("session_id", sessionID),
+			zap.String("task_id", running.TaskID),
+			zap.Error(err))
+	}
+}
+
+func isTaskSessionNotFound(err error) bool {
+	return errors.Is(err, models.ErrTaskSessionNotFound)
+}
+
 // handleTerminalSessionOnStartup processes sessions in terminal states during startup.
 // Returns true if the session should be skipped (no further processing needed).
 func (s *Service) handleTerminalSessionOnStartup(ctx context.Context, session *models.TaskSession, running *models.ExecutorRunning, previousState models.TaskSessionState) bool {
 	sessionID := session.ID
 	switch previousState {
 	case models.TaskSessionStateCompleted, models.TaskSessionStateCancelled:
-		s.logger.Info("session in terminal state; cleaning up executor record",
+		s.logger.Info("session in terminal state; stopping runtime before cleaning up executor record",
 			zap.String("session_id", sessionID),
 			zap.String("task_id", session.TaskID),
 			zap.String("state", string(previousState)))
+		executionID := strings.TrimSpace(running.AgentExecutionID)
+		if executionID != "" && s.agentManager != nil {
+			if err := s.agentManager.StopAgentWithReason(ctx, executionID, "startup terminal session cleanup", true); err != nil {
+				s.logger.Warn("failed to stop terminal session runtime; preserving executor record",
+					zap.String("session_id", sessionID),
+					zap.String("execution_id", executionID),
+					zap.Error(err))
+				return true
+			}
+		}
 		if err := s.repo.DeleteExecutorRunningBySessionID(ctx, sessionID); err != nil {
 			s.logger.Warn("failed to remove executor record for terminal session",
 				zap.String("session_id", sessionID),
@@ -1121,7 +1165,7 @@ func (s *Service) handleFailedSessionOnStartup(ctx context.Context, session *mod
 	// If session failed, ensure task is in REVIEW state (not stuck IN_PROGRESS)
 	if session.TaskID != "" {
 		task, taskErr := s.taskRepo.GetTask(ctx, session.TaskID)
-		if taskErr == nil && task.State == v1.TaskStateInProgress {
+		if taskErr == nil && task != nil && task.State == v1.TaskStateInProgress {
 			s.logger.Info("fixing task state: session failed but task still IN_PROGRESS",
 				zap.String("task_id", session.TaskID),
 				zap.String("session_id", sessionID))
@@ -1137,9 +1181,19 @@ func (s *Service) handleFailedSessionOnStartup(ctx context.Context, session *mod
 			zap.String("session_id", sessionID),
 			zap.String("task_id", session.TaskID))
 	} else {
-		s.logger.Info("cleaning up executor record for non-resumable failed session",
+		s.logger.Info("stopping failed session runtime before cleaning up executor record",
 			zap.String("session_id", sessionID),
 			zap.String("task_id", session.TaskID))
+		executionID := strings.TrimSpace(running.AgentExecutionID)
+		if executionID != "" && s.agentManager != nil {
+			if err := s.agentManager.StopAgentWithReason(ctx, executionID, "startup failed session cleanup", true); err != nil {
+				s.logger.Warn("failed to stop failed session runtime; preserving executor record",
+					zap.String("session_id", sessionID),
+					zap.String("execution_id", executionID),
+					zap.Error(err))
+				return
+			}
+		}
 		if err := s.repo.DeleteExecutorRunningBySessionID(ctx, sessionID); err != nil {
 			s.logger.Warn("failed to remove executor record for failed session",
 				zap.String("session_id", sessionID),

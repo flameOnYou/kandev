@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/kandev/kandev/internal/agentruntime"
 	"github.com/kandev/kandev/internal/common/logger"
 	"github.com/kandev/kandev/internal/db"
 	"github.com/kandev/kandev/internal/events/bus"
@@ -477,6 +479,374 @@ func TestService_DeleteTask(t *testing.T) {
 	}
 }
 
+func TestService_DeleteTaskStopsExecutorRunningForTerminalSession(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:     "session-completed",
+		TaskID: "task-123",
+		State:  models.TaskSessionStateCompleted,
+	})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-completed",
+		SessionID:        "session-completed",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-terminal",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+
+	if err := svc.DeleteTask(ctx, "task-123"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+
+	call := stopper.waitForStopExecution(t)
+	if call.executionID != "exec-terminal" {
+		t.Fatalf("StopExecution executionID = %q, want exec-terminal", call.executionID)
+	}
+	if call.reason != "task deleted" {
+		t.Fatalf("StopExecution reason = %q, want task deleted", call.reason)
+	}
+	if !call.force {
+		t.Fatal("StopExecution force = false, want true")
+	}
+	waitForCleanupDone(t, svc)
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-completed"); !errors.Is(err, models.ErrExecutorRunningNotFound) {
+		t.Fatalf("executor row should be removed after successful stop, got %v", err)
+	}
+}
+
+func TestService_DeleteTaskPreservesExecutorRunningWhenStopFails(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	stopper.stopExecutionErr = errors.New("runtime still shutting down")
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+	quickChatDir := t.TempDir()
+	svc.SetQuickChatDir(quickChatDir)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:     "session-completed",
+		TaskID: "task-123",
+		State:  models.TaskSessionStateCompleted,
+	})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-completed",
+		SessionID:        "session-completed",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-terminal",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+	sessionDir := filepath.Join(quickChatDir, "session-completed")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+
+	if err := svc.DeleteTask(ctx, "task-123"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+	_ = stopper.waitForStopExecution(t)
+	waitForCleanupDone(t, svc)
+
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-completed"); err != nil {
+		t.Fatalf("executor row should remain retryable after stop failure: %v", err)
+	}
+	if _, err := os.Stat(sessionDir); err != nil {
+		t.Fatalf("quick-chat directory should remain when stop fails: %v", err)
+	}
+}
+
+func TestService_DeleteTaskCleansSuccessfulSessionResourcesOnPartialStopFailure(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	stopper.stopExecutionErrByID = map[string]error{
+		"exec-failed": errors.New("runtime still shutting down"),
+	}
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+	quickChatDir := t.TempDir()
+	svc.SetQuickChatDir(quickChatDir)
+	cleanup := &recordingWorktreeCleanup{
+		worktrees: []*worktree.Worktree{
+			{ID: "wt-failed", TaskID: "task-123", SessionID: "session-failed"},
+			{ID: "wt-ok", TaskID: "task-123", SessionID: "session-ok"},
+		},
+	}
+	svc.SetWorktreeCleanup(cleanup)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	for _, sessionID := range []string{"session-failed", "session-ok"} {
+		_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+			ID:     sessionID,
+			TaskID: "task-123",
+			State:  models.TaskSessionStateCompleted,
+		})
+		sessionDir := filepath.Join(quickChatDir, sessionID)
+		if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+			t.Fatalf("mkdir session dir: %v", err)
+		}
+	}
+	for _, row := range []*models.ExecutorRunning{
+		{
+			ID:               "session-failed",
+			SessionID:        "session-failed",
+			TaskID:           "task-123",
+			ExecutorID:       "executor-1",
+			Runtime:          agentruntime.RuntimeStandalone,
+			Status:           models.ExecutorRunningStatusStarting,
+			AgentExecutionID: "exec-failed",
+		},
+		{
+			ID:               "session-ok",
+			SessionID:        "session-ok",
+			TaskID:           "task-123",
+			ExecutorID:       "executor-1",
+			Runtime:          agentruntime.RuntimeStandalone,
+			Status:           models.ExecutorRunningStatusStarting,
+			AgentExecutionID: "exec-ok",
+		},
+	} {
+		if err := repo.UpsertExecutorRunning(ctx, row); err != nil {
+			t.Fatalf("seed executor running: %v", err)
+		}
+	}
+
+	if err := svc.DeleteTask(ctx, "task-123"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+	calls := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		calls[stopper.waitForStopExecution(t).executionID] = true
+	}
+	if !calls["exec-failed"] || !calls["exec-ok"] {
+		t.Fatalf("unexpected StopExecution calls: %#v", calls)
+	}
+	waitForCleanupDone(t, svc)
+	if _, err := os.Stat(filepath.Join(quickChatDir, "session-ok")); !os.IsNotExist(err) {
+		t.Fatalf("successful session quick-chat directory should be removed, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(quickChatDir, "session-failed")); err != nil {
+		t.Fatalf("failed session quick-chat directory should remain: %v", err)
+	}
+	if len(cleanup.cleaned) != 1 || cleanup.cleaned[0].ID != "wt-ok" {
+		t.Fatalf("expected only successful session worktree cleanup, got %#v", cleanup.cleaned)
+	}
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-failed"); err != nil {
+		t.Fatalf("failed session executor row should remain retryable: %v", err)
+	}
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-ok"); err == nil {
+		t.Fatal("successful session executor row should be removed")
+	}
+}
+
+func TestService_DeleteTaskCleansMissingSessionExecutorRowAfterStop(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-missing",
+		SessionID:        "session-missing",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-missing",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+
+	if err := svc.DeleteTask(ctx, "task-123"); err != nil {
+		t.Fatalf("DeleteTask: %v", err)
+	}
+	call := stopper.waitForStopExecution(t)
+	if call.executionID != "exec-missing" {
+		t.Fatalf("StopExecution executionID = %q, want exec-missing", call.executionID)
+	}
+	waitForCleanupDone(t, svc)
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-missing"); !errors.Is(err, models.ErrExecutorRunningNotFound) {
+		t.Fatalf("missing-session executor row should be removed after successful stop, got %v", err)
+	}
+}
+
+func TestService_ArchiveTaskStopsExecutorRunningForTerminalSession(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	stopper := newRecordingTaskExecutionStopper()
+	svc.SetExecutionStopper(stopper)
+	svc.setCleanupDoneForTestHook(make(chan struct{}, 1))
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:     "session-completed",
+		TaskID: "task-123",
+		State:  models.TaskSessionStateCompleted,
+	})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-completed",
+		SessionID:        "session-completed",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-terminal",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+
+	if err := svc.ArchiveTask(ctx, "task-123"); err != nil {
+		t.Fatalf("ArchiveTask: %v", err)
+	}
+
+	call := stopper.waitForStopExecution(t)
+	if call.executionID != "exec-terminal" {
+		t.Fatalf("StopExecution executionID = %q, want exec-terminal", call.executionID)
+	}
+	if call.reason != "task archived" {
+		t.Fatalf("StopExecution reason = %q, want task archived", call.reason)
+	}
+	if !call.force {
+		t.Fatal("StopExecution force = false, want true")
+	}
+	waitForCleanupDone(t, svc)
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-completed"); !errors.Is(err, models.ErrExecutorRunningNotFound) {
+		t.Fatalf("executor row should be removed after successful stop, got %v", err)
+	}
+}
+
+func TestService_DeleteTaskFailsClosedWhenRuntimeInventoryFails(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	inventoryErr := errors.New("inventory unavailable")
+	svc.SetExecutionStopper(newRecordingTaskExecutionStopper())
+	svc.executors = failingExecutorRepository{
+		ExecutorRepository: repo,
+		listByTaskErr:      inventoryErr,
+	}
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+
+	err := svc.DeleteTask(ctx, "task-123")
+	if !errors.Is(err, inventoryErr) {
+		t.Fatalf("DeleteTask error = %v, want inventory error", err)
+	}
+	if _, err := repo.GetTask(ctx, "task-123"); err != nil {
+		t.Fatalf("task should remain when runtime inventory fails: %v", err)
+	}
+}
+
+func TestService_ArchiveTaskFailsClosedWhenRuntimeInventoryFails(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	inventoryErr := errors.New("inventory unavailable")
+	svc.SetExecutionStopper(newRecordingTaskExecutionStopper())
+	svc.executors = failingExecutorRepository{
+		ExecutorRepository: repo,
+		listByTaskErr:      inventoryErr,
+	}
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+
+	err := svc.ArchiveTask(ctx, "task-123")
+	if !errors.Is(err, inventoryErr) {
+		t.Fatalf("ArchiveTask error = %v, want inventory error", err)
+	}
+	task, err := repo.GetTask(ctx, "task-123")
+	if err != nil {
+		t.Fatalf("task should remain when runtime inventory fails: %v", err)
+	}
+	if task.ArchivedAt != nil {
+		t.Fatal("task should not be archived when runtime inventory fails")
+	}
+}
+
+func TestService_CleanupTaskResourcesFailsClosedWhenRuntimeInventoryFails(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	inventoryErr := errors.New("inventory unavailable")
+	svc.SetExecutionStopper(newRecordingTaskExecutionStopper())
+	svc.executors = failingExecutorRepository{
+		ExecutorRepository: repo,
+		listByTaskErr:      inventoryErr,
+	}
+	quickChatDir := t.TempDir()
+	svc.SetQuickChatDir(quickChatDir)
+	cleanup := &recordingWorktreeCleanup{
+		worktrees: []*worktree.Worktree{
+			{ID: "wt-1", TaskID: "task-123", SessionID: "session-completed"},
+		},
+	}
+	svc.SetWorktreeCleanup(cleanup)
+
+	_ = repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"})
+	_ = repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-123", WorkspaceID: "ws-1", Name: "Workflow"})
+	_ = repo.CreateTask(ctx, &models.Task{ID: "task-123", WorkspaceID: "ws-1", WorkflowID: "wf-123", WorkflowStepID: "step-123", Title: "Test", Priority: "medium"})
+	_ = repo.CreateTaskSession(ctx, &models.TaskSession{
+		ID:     "session-completed",
+		TaskID: "task-123",
+		State:  models.TaskSessionStateCompleted,
+	})
+	if err := repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
+		ID:               "session-completed",
+		SessionID:        "session-completed",
+		TaskID:           "task-123",
+		ExecutorID:       "executor-1",
+		Runtime:          agentruntime.RuntimeStandalone,
+		Status:           models.ExecutorRunningStatusStarting,
+		AgentExecutionID: "exec-terminal",
+	}); err != nil {
+		t.Fatalf("seed executor running: %v", err)
+	}
+	sessionDir := filepath.Join(quickChatDir, "session-completed")
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+
+	svc.CleanupTaskResources(ctx, "task-123", true)
+
+	if _, err := repo.GetExecutorRunningBySessionID(ctx, "session-completed"); err != nil {
+		t.Fatalf("executor row should remain when runtime inventory fails: %v", err)
+	}
+	if _, err := os.Stat(sessionDir); err != nil {
+		t.Fatalf("quick-chat directory should remain when runtime inventory fails: %v", err)
+	}
+	if len(cleanup.cleaned) != 0 {
+		t.Fatalf("worktrees should not be cleaned when runtime inventory fails, got %#v", cleanup.cleaned)
+	}
+}
+
 func TestService_ListTasks(t *testing.T) {
 	svc, _, repo := createTestService(t)
 	ctx := context.Background()
@@ -492,6 +862,87 @@ func TestService_ListTasks(t *testing.T) {
 	}
 	if len(tasks) != 2 {
 		t.Errorf("expected 2 tasks, got %d", len(tasks))
+	}
+}
+
+type stopExecutionCall struct {
+	executionID string
+	reason      string
+	force       bool
+}
+
+type recordingTaskExecutionStopper struct {
+	stopExecutionCh      chan stopExecutionCall
+	stopExecutionErr     error
+	stopExecutionErrByID map[string]error
+}
+
+func newRecordingTaskExecutionStopper() *recordingTaskExecutionStopper {
+	return &recordingTaskExecutionStopper{stopExecutionCh: make(chan stopExecutionCall, 8)}
+}
+
+func (s *recordingTaskExecutionStopper) StopTask(context.Context, string, string, bool) error {
+	return nil
+}
+
+func (s *recordingTaskExecutionStopper) StopSession(context.Context, string, string, bool) error {
+	return nil
+}
+
+func (s *recordingTaskExecutionStopper) StopExecution(_ context.Context, executionID, reason string, force bool) error {
+	s.stopExecutionCh <- stopExecutionCall{executionID: executionID, reason: reason, force: force}
+	if s.stopExecutionErrByID != nil {
+		if err := s.stopExecutionErrByID[executionID]; err != nil {
+			return err
+		}
+	}
+	return s.stopExecutionErr
+}
+
+func (s *recordingTaskExecutionStopper) waitForStopExecution(t *testing.T) stopExecutionCall {
+	t.Helper()
+	select {
+	case call := <-s.stopExecutionCh:
+		return call
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for StopExecution")
+		return stopExecutionCall{}
+	}
+}
+
+type failingExecutorRepository struct {
+	repository.ExecutorRepository
+	listByTaskErr error
+}
+
+func (r failingExecutorRepository) ListExecutorsRunningByTaskID(context.Context, string) ([]*models.ExecutorRunning, error) {
+	return nil, r.listByTaskErr
+}
+
+type recordingWorktreeCleanup struct {
+	worktrees []*worktree.Worktree
+	cleaned   []*worktree.Worktree
+}
+
+func (c *recordingWorktreeCleanup) OnTaskDeleted(context.Context, string) error {
+	return nil
+}
+
+func (c *recordingWorktreeCleanup) GetAllByTaskID(context.Context, string) ([]*worktree.Worktree, error) {
+	return c.worktrees, nil
+}
+
+func (c *recordingWorktreeCleanup) CleanupWorktrees(_ context.Context, worktrees []*worktree.Worktree) error {
+	c.cleaned = append(c.cleaned, worktrees...)
+	return nil
+}
+
+func waitForCleanupDone(t *testing.T, svc *Service) {
+	t.Helper()
+	select {
+	case <-svc.cleanupDoneForTest:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for async task cleanup")
 	}
 }
 

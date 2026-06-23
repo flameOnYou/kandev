@@ -194,6 +194,8 @@ type Service struct {
 	blockers              BlockerRepository
 	comments              CommentRepository
 	baseBranchPusher      AgentBaseBranchPusher
+	// cleanupDoneForTest lets unit tests wait for async cleanup; nil in production.
+	cleanupDoneForTest chan struct{}
 }
 
 // NewService creates a new task service
@@ -222,6 +224,10 @@ func NewService(repos Repos, eventBus bus.EventBus, log *logger.Logger, discover
 // SetWorktreeCleanup sets the worktree cleanup handler for task deletion.
 func (s *Service) SetWorktreeCleanup(cleanup WorktreeCleanup) {
 	s.worktreeCleanup = cleanup
+}
+
+func (s *Service) setCleanupDoneForTestHook(ch chan struct{}) {
+	s.cleanupDoneForTest = ch
 }
 
 // SetBranchMaterializer wires the mid-session worktree materializer for

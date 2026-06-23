@@ -286,10 +286,10 @@ func TestPerformTaskCleanup_TearsDownTaskEnvironmentAndDeletesRow(t *testing.T) 
 	svc := newResetTestService(t, repo)
 	svc.SetEnvironmentDestroyer(destroyer)
 
-	errs := svc.performTaskCleanup(context.Background(), "task-1", nil, nil, taskEnvironmentCleanup{
+	errs := svc.performTaskCleanup(context.Background(), "task-1", nil, nil, nil, taskEnvironmentCleanup{
 		env:       env,
 		deleteRow: true,
-	}, false)
+	}, nil)
 
 	if len(errs) != 0 {
 		t.Fatalf("unexpected cleanup errors: %v", errs)
