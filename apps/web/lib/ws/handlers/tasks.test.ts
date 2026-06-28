@@ -9,6 +9,8 @@ vi.mock("@/lib/recent-tasks", () => ({
 }));
 
 const SESS_OTHER = "sess-other";
+const SESS_DRIFTED = "sess-drifted";
+const SESS_PINNED = "sess-pinned";
 
 type Listener = (state: AppState) => void;
 
@@ -238,6 +240,108 @@ describe("task.updated primary-session focus follow (pinning)", () => {
     handlers["task.updated"]!(makeMessage(makeTask("t1", "sess-new")));
 
     expect(setActiveSessionAuto).not.toHaveBeenCalled();
+  });
+
+  it("does NOT follow focus when active-session drift orphaned a non-terminal pin", () => {
+    store = makeStore({
+      kanban: {
+        workflowId: "wf1",
+        steps: [],
+        tasks: [{ id: "t1", primarySessionId: SESS_DRIFTED, workflowId: "wf1" }],
+      } as unknown as AppState["kanban"],
+      tasks: {
+        activeTaskId: "t1",
+        activeSessionId: SESS_DRIFTED,
+        pinnedSessionId: SESS_PINNED,
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: {
+          [SESS_PINNED]: { id: SESS_PINNED, task_id: "t1", state: "RUNNING" },
+          [SESS_DRIFTED]: { id: SESS_DRIFTED, task_id: "t1", state: "COMPLETED" },
+        },
+      } as unknown as AppState["taskSessions"],
+      setActiveSessionAuto,
+    });
+
+    const handlers = registerTasksHandlers(store);
+    handlers["task.updated"]!(makeMessage(makeTask("t1", "sess-new")));
+
+    expect(setActiveSessionAuto).not.toHaveBeenCalled();
+  });
+});
+
+describe("task.updated primary-session focus follow (stale pin cleanup)", () => {
+  let store: ReturnType<typeof makeStore>;
+  let setActiveSessionAuto: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    setActiveSessionAuto = vi.fn();
+    vi.mocked(removeRecentTask).mockClear();
+  });
+
+  it("clears a terminal orphaned pin when following focus to the new primary", () => {
+    store = makeStore({
+      kanban: {
+        workflowId: "wf1",
+        steps: [],
+        tasks: [{ id: "t1", primarySessionId: SESS_DRIFTED, workflowId: "wf1" }],
+      } as unknown as AppState["kanban"],
+      tasks: {
+        activeTaskId: "t1",
+        activeSessionId: SESS_DRIFTED,
+        pinnedSessionId: SESS_PINNED,
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: {
+          [SESS_PINNED]: { id: SESS_PINNED, task_id: "t1", state: "COMPLETED" },
+          [SESS_DRIFTED]: { id: SESS_DRIFTED, task_id: "t1", state: "COMPLETED" },
+        },
+      } as unknown as AppState["taskSessions"],
+      setActiveSessionAuto,
+    });
+
+    const handlers = registerTasksHandlers(store);
+    handlers["task.updated"]!(makeMessage(makeTask("t1", "sess-new")));
+
+    expect(setActiveSessionAuto).toHaveBeenCalledWith("t1", "sess-new");
+    expect(store.getState().tasks.pinnedSessionId).toBeNull();
+  });
+
+  it("clears a deleted orphaned pin when following focus to the new primary", () => {
+    store = makeStore({
+      kanban: {
+        workflowId: "wf1",
+        steps: [],
+        tasks: [{ id: "t1", primarySessionId: SESS_DRIFTED, workflowId: "wf1" }],
+      } as unknown as AppState["kanban"],
+      tasks: {
+        activeTaskId: "t1",
+        activeSessionId: SESS_DRIFTED,
+        pinnedSessionId: SESS_PINNED,
+        lastSessionByTaskId: {},
+      },
+      taskSessions: {
+        items: {
+          [SESS_DRIFTED]: { id: SESS_DRIFTED, task_id: "t1", state: "COMPLETED" },
+        },
+      } as unknown as AppState["taskSessions"],
+      taskSessionsByTask: {
+        itemsByTaskId: {
+          t1: [{ id: SESS_DRIFTED, task_id: "t1", state: "COMPLETED" }],
+        },
+        loadedByTaskId: { t1: true },
+        loadingByTaskId: {},
+      } as unknown as AppState["taskSessionsByTask"],
+      setActiveSessionAuto,
+    });
+
+    const handlers = registerTasksHandlers(store);
+    handlers["task.updated"]!(makeMessage(makeTask("t1", "sess-new")));
+
+    expect(setActiveSessionAuto).toHaveBeenCalledWith("t1", "sess-new");
+    expect(store.getState().tasks.pinnedSessionId).toBeNull();
   });
 });
 
