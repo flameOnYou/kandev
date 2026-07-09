@@ -1112,6 +1112,7 @@ func registerMCPAndDebugRoutes(
 	// Wire config-mode dependencies for agent-native configuration
 	mcpHandlers.SetConfigDeps(p.services.Workflow, p.agentSettingsController, p.mcpConfigSvc)
 	mcpHandlers.SetClarificationInputPauser(p.orchestratorSvc)
+	mcpHandlers.SetPromptReferenceResolver(p.services.Prompts)
 
 	// Enrich list_tasks responses with associated GitHub PRs (link, title,
 	// number, state) when the github service is available.
