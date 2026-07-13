@@ -22,6 +22,10 @@ func resolvePorts(opts Options) (int, error) {
 			return 0, err
 		} else if p != 0 {
 			backend = p
+		} else if p, err := envPort("KANDEV_SERVER_PORT"); err != nil {
+			return 0, err
+		} else if p != 0 {
+			backend = p
 		} else if p, err := envPort("KANDEV_PORT"); err != nil {
 			return 0, err
 		} else {
