@@ -34,6 +34,8 @@ MAGENTA := \033[35m
 
 VERBOSE ?= 0
 NODE ?= $(shell command -v node 2>/dev/null || echo node)
+PNPM_INSTALL_REPORTER ?= append-only
+PNPM_INSTALL_LOGLEVEL ?= info
 SERVICE_LAUNCHER := $(CURDIR)/dist/kandev/bin/kandev
 SERVICE_BUNDLE_DIR := $(CURDIR)/dist/kandev
 SERVICE_VERSION := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
@@ -93,6 +95,7 @@ help:
 	@echo "  service-config           Show service launcher/config paths"
 	@echo "  service-install PORT=3000 HOME_DIR=/path  Optional install overrides"
 	@echo "  service-install NO_BOOT_START=1  Skip Linux user-service boot hint"
+	@echo "  service-install PNPM_INSTALL_LOGLEVEL=debug  Show detailed dependency install logs"
 	@echo ""
 	@echo "Build Commands:"
 	@echo "  build            Build backend and web app"
@@ -365,9 +368,17 @@ install-backend:
 .PHONY: install-web
 install-web:
 	@printf "$(CYAN)Installing web dependencies...$(RESET)\n"
-	@(cd $(APPS_DIR) && $(PNPM) install --silent 2>/dev/null) || (cd $(APPS_DIR) && $(PNPM) install)
+	@printf "  Node: " && $(NODE) --version
+	@printf "  pnpm: " && cd $(APPS_DIR) && $(PNPM) --version
+	@printf "  Registry: " && cd $(APPS_DIR) && $(PNPM) config get registry
+	@printf "  Store: " && cd $(APPS_DIR) && $(PNPM) store path
+	@printf "  Command: pnpm install --reporter=$(PNPM_INSTALL_REPORTER) --loglevel=$(PNPM_INSTALL_LOGLEVEL)\n"
+	@cd $(APPS_DIR) && $(PNPM) install --reporter=$(PNPM_INSTALL_REPORTER) --loglevel=$(PNPM_INSTALL_LOGLEVEL)
+	$(call success,Web dependencies installed)
 	@printf "$(CYAN)Installing Playwright browsers...$(RESET)\n"
+	@printf "  Command: pnpm --filter @kandev/web exec playwright install chromium\n"
 	@cd $(APPS_DIR) && $(PNPM) --filter @kandev/web exec playwright install chromium
+	$(call success,Playwright browser ready)
 
 #
 # Testing
