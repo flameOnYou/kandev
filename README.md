@@ -10,6 +10,94 @@ Manage and run tasks in parallel. Orchestrate agents. Review changes. Ship value
 
 [See screenshots](docs/screenshots.md)
 
+## Personal Fork Maintenance
+
+> 本节仅适用于 `flameOnYou/kandev` 的 `personal/main` 分支。该分支在兼容
+> [`kdlbs/kandev`](https://github.com/kdlbs/kandev) 上游更新的同时，维护个人定制和部署修复。
+
+### Branch Rules
+
+- `main` 只用于镜像官方 `upstream/main`，不直接放置个人修改。
+- `personal/main` 保存个人补丁，是测试和部署使用的唯一长期分支。
+- 独立功能可以在 `feature/*` 分支开发，完成后整理为小而独立的提交放入 `personal/main`。
+- 不把 `personal/main` 合并回 `main`，也不对 `main` 强制推送。
+- 提交遵循 Conventional Commits，例如 `fix(service): ...`、`feat(personal): ...`。
+- 可以复用的通用修复应单独提交并尽量贡献给上游；上游合并后，从个人补丁栈中删除重复提交。
+- 密钥、凭据、运行数据和本机环境配置不得提交到 Git；运行数据继续保存在 `~/.kandev`。
+
+### Clone This Fork
+
+```bash
+git clone -b personal/main git@github.com:flameOnYou/kandev.git
+cd kandev
+
+# 为后续同步建立本地 main 和官方 upstream。
+git branch --track main origin/main
+git remote add upstream git@github.com:kdlbs/kandev.git
+git fetch upstream --prune
+git config rerere.enabled true
+```
+
+`rerere` 会记录已经解决过的冲突，减少后续 rebase 时重复处理相同冲突的成本。
+
+### Sync With Upstream
+
+同步前必须提交或暂存当前工作，并确认工作区干净：
+
+```bash
+git status --short
+git fetch upstream --prune
+
+# main 始终快进到官方上游。
+git switch main
+git merge --ff-only upstream/main
+git push origin main
+
+# 将个人补丁重放到最新版上游之上。
+git switch personal/main
+git rebase main
+```
+
+如有冲突，解决后执行：
+
+```bash
+git add <resolved-files>
+git rebase --continue
+```
+
+需要放弃本次同步时执行 `git rebase --abort`。验证通过后，只对个人分支使用安全强推：
+
+```bash
+git push --force-with-lease origin personal/main
+```
+
+### Validate and Install the Service
+
+上游同步或个人代码修改后，先格式化并运行检查：
+
+```bash
+make fmt
+make typecheck
+make test
+make lint
+```
+
+从当前 `personal/main` 构建并安装用户服务，固定使用 `18080` 端口：
+
+```bash
+make service-install PORT=18080
+curl -fsS http://127.0.0.1:18080/health
+```
+
+`service-install` 会重新构建当前检出、刷新服务配置并重启服务，不会删除 `~/.kandev` 中的任务和数据库。
+
+部署验证通过后，可以用个人标签记录可回滚版本：
+
+```bash
+git tag personal-YYYYMMDD-NN
+git push origin personal-YYYYMMDD-NN
+```
+
 ## What
 
 
