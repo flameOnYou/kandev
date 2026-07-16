@@ -145,3 +145,299 @@ test("rejects published pages without title and description frontmatter", async 
     /index.md must start with YAML frontmatter containing title and description/,
   );
 });
+
+test("accepts existing relative page and asset links", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        "[Guide](guide.md)\n\n![Diagram](assets/diagram.png)",
+      ),
+      "guide.md": validPage,
+      "assets/diagram.png": "not-a-real-png",
+    },
+    { pages: ["index", "guide"] },
+  );
+
+  await assert.doesNotReject(validatePublicDocs(dir));
+});
+
+test("rejects a broken local page link", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace("Page body.", "[Missing](missing.md)"),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.rejects(
+    validatePublicDocs(dir),
+    /index.md links to missing local target: missing.md/,
+  );
+});
+
+test("rejects a broken local image", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        "![Missing](assets/missing.png)",
+      ),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.rejects(
+    validatePublicDocs(dir),
+    /index.md links to missing local target: assets\/missing.png/,
+  );
+});
+
+test("rejects a broken local image nested inside a link", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        "[![Missing](assets/missing.png)](guide.md)",
+      ),
+      "guide.md": validPage,
+    },
+    { pages: ["index", "guide"] },
+  );
+
+  await assert.rejects(
+    validatePublicDocs(dir),
+    /index.md links to missing local target: assets\/missing.png/,
+  );
+});
+
+test("ignores external, anchor-only, and fenced-code links", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        `[External](https://example.com/docs)\n\n[Section](#section)\n\n\`\`\`md
+[Example only](does-not-exist.md)
+\`\`\``,
+      ),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.doesNotReject(validatePublicDocs(dir));
+});
+
+test("ignores links inside inline code and nested shorter fences", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        `Use \`[example](inline-missing.md)\` in prose.
+
+\`\`\`\`md
+\`\`\`md
+[Example only](fenced-missing.md)
+\`\`\`
+\`\`\`\``,
+      ),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.doesNotReject(validatePublicDocs(dir));
+});
+
+test("ignores links inside indented code blocks", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        `Example only:
+
+    [Missing](indented-missing.md)`,
+      ),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.doesNotReject(validatePublicDocs(dir));
+});
+
+test("ignores indented code blocks after a heading", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        `## Example
+    [Missing](heading-code-missing.md)`,
+      ),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.doesNotReject(validatePublicDocs(dir));
+});
+
+test("ignores indented code blocks nested in list items", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        `- Example only:
+
+      [Missing](list-code-missing.md)`,
+      ),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.doesNotReject(validatePublicDocs(dir));
+});
+
+test("validates links in indented list paragraphs", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        `- Related material:
+
+    [Missing](list-paragraph-missing.md)`,
+      ),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.rejects(
+    validatePublicDocs(dir),
+    /index.md links to missing local target: list-paragraph-missing.md/,
+  );
+});
+
+test("accepts escaped parentheses in local link destinations", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace("Page body.", "[Guide](guide\\(1\\).md)"),
+      "guide(1).md": validPage,
+    },
+    { pages: ["index", "guide(1)"] },
+  );
+
+  await assert.doesNotReject(validatePublicDocs(dir));
+});
+
+test("accepts balanced parentheses in local link destinations", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace("Page body.", "[Guide](guide(1).md)"),
+      "guide(1).md": validPage,
+    },
+    { pages: ["index", "guide(1)"] },
+  );
+
+  await assert.doesNotReject(validatePublicDocs(dir));
+});
+
+test("validates reference-style link definitions", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        "[Guide][user guide]\n\n[user guide]: missing.md",
+      ),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.rejects(
+    validatePublicDocs(dir),
+    /index.md links to missing local target: missing.md/,
+  );
+});
+
+test("rejects undefined full reference-style links", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace("Page body.", "[Guide][missing guide]"),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.rejects(
+    validatePublicDocs(dir),
+    /index.md uses undefined Markdown reference: missing guide/,
+  );
+});
+
+test("validates collapsed reference-style links", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        "[Guide][]\n\n[guide]: missing.md",
+      ),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.rejects(
+    validatePublicDocs(dir),
+    /index.md links to missing local target: missing.md/,
+  );
+});
+
+test("rejects undefined shortcut reference-style links", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace("Page body.", "Read the [Guide]."),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.rejects(
+    validatePublicDocs(dir),
+    /index.md uses undefined Markdown reference: guide/,
+  );
+});
+
+test("ignores non-reference bracket syntax", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace(
+        "Page body.",
+        "> [!WARNING]\n\n- [x] Done\n\n[^note]\n\n\\[Literal]",
+      ),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.doesNotReject(validatePublicDocs(dir));
+});
+
+test("checks local links in README files", async () => {
+  const dir = await createDocs(
+    {
+      "README.md": "# Contributing\n\n[Missing](missing.md)",
+      "index.md": validPage,
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.rejects(
+    validatePublicDocs(dir),
+    /README.md links to missing local target: missing.md/,
+  );
+});
+
+test("rejects site-root links because public docs use relative sources", async () => {
+  const dir = await createDocs(
+    {
+      "index.md": validPage.replace("Page body.", "[Guide](/docs/guide)"),
+    },
+    { pages: ["index"] },
+  );
+
+  await assert.rejects(
+    validatePublicDocs(dir),
+    /index.md uses a site-root link instead of a relative source link: \/docs\/guide/,
+  );
+});

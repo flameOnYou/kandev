@@ -22,9 +22,11 @@ export async function validatePublicDocs(
   const pagesBySlug = new Map();
 
   for (const file of files) {
+    const markdown = await fs.readFile(path.join(docsDir, file), "utf8");
+    await assertLocalLinks(docsDir, file, markdown);
+
     if (path.posix.basename(file).toLowerCase() === "readme.md") continue;
 
-    const markdown = await fs.readFile(path.join(docsDir, file), "utf8");
     assertFrontmatter(file, markdown);
 
     const slug = file.replace(/\.mdx?$/, "").replace(/\/index$/, "");
@@ -124,6 +126,286 @@ function assertFrontmatter(file, markdown) {
       `${file} must start with YAML frontmatter containing title and description`,
     );
   }
+}
+
+/**
+ * Require every relative Markdown link or image to resolve on disk.
+ *
+ * @param {string} docsDir Published docs root.
+ * @param {string} file Relative source path used in validation errors.
+ * @param {string} markdown Page source.
+ * @returns {Promise<void>}
+ */
+async function assertLocalLinks(docsDir, file, markdown) {
+  const source = stripMarkdownCode(markdown);
+  const definitionPattern = /^\s{0,3}\[([^\]\n]+)\]:\s*(\S.*)$/gm;
+  const referencePattern = /!?\[([^\]\n]+)\]\[([^\]\n]*)\]/g;
+  const shortcutReferencePattern = /(?<![!\\\[\]])\[([^\]\n]+)\](?![\[(:])/g;
+  const destinations = collectInlineLinkDestinations(source);
+  const definitions = new Map();
+
+  for (const match of source.matchAll(definitionPattern)) {
+    if (match[1].startsWith("^")) continue;
+    const label = normalizeReferenceLabel(match[1]);
+    definitions.set(label, match[2]);
+    destinations.push(match[2]);
+  }
+
+  for (const match of source.matchAll(referencePattern)) {
+    const label = normalizeReferenceLabel(match[2] || match[1]);
+    if (!definitions.has(label)) {
+      throw new Error(`${file} uses undefined Markdown reference: ${label}`);
+    }
+  }
+
+  for (const match of source.matchAll(shortcutReferencePattern)) {
+    const label = normalizeReferenceLabel(match[1]);
+    // Admonitions, footnotes, and task boxes use brackets but are not links.
+    if (
+      !label ||
+      label.startsWith("!") ||
+      label.startsWith("^") ||
+      /^(?:x|-)$/i.test(label)
+    ) {
+      continue;
+    }
+    if (!definitions.has(label)) {
+      throw new Error(`${file} uses undefined Markdown reference: ${label}`);
+    }
+  }
+
+  for (const destination of destinations) {
+    const href = parseMarkdownDestination(destination);
+    if (!href || href.startsWith("#") || isExternalDestination(href)) {
+      continue;
+    }
+    if (href.startsWith("/")) {
+      throw new Error(
+        `${file} uses a site-root link instead of a relative source link: ${href}`,
+      );
+    }
+
+    const pathOnly = href.split(/[?#]/, 1)[0];
+    if (!pathOnly) continue;
+
+    let decoded;
+    try {
+      decoded = decodeURIComponent(pathOnly);
+    } catch {
+      throw new Error(`${file} contains an invalid encoded local link: ${href}`);
+    }
+
+    const target = path.resolve(
+      path.dirname(path.join(docsDir, file)),
+      decoded.replace(/\\([\\() ])/g, "$1"),
+    );
+    try {
+      await fs.access(target);
+    } catch {
+      throw new Error(`${file} links to missing local target: ${href}`);
+    }
+  }
+}
+
+/**
+ * Collect inline Markdown destinations while preserving balanced parentheses.
+ *
+ * @param {string} markdown Markdown with code regions removed.
+ * @returns {string[]} Raw content inside each link's parentheses.
+ */
+function collectInlineLinkDestinations(markdown) {
+  const destinations = [];
+
+  for (let start = 0; start < markdown.length; start += 1) {
+    if (markdown[start] !== "[" || isEscaped(markdown, start)) continue;
+
+    let bracketDepth = 1;
+    let labelEnd = -1;
+    for (let cursor = start + 1; cursor < markdown.length; cursor += 1) {
+      const character = markdown[cursor];
+      if (character === "\n" || character === "\r") break;
+      if (character === "\\") {
+        cursor += 1;
+      } else if (character === "[") {
+        bracketDepth += 1;
+      } else if (character === "]") {
+        bracketDepth -= 1;
+        if (bracketDepth === 0) {
+          labelEnd = cursor;
+          break;
+        }
+      }
+    }
+
+    if (labelEnd === -1 || markdown[labelEnd + 1] !== "(") continue;
+
+    let parenthesisDepth = 1;
+    for (let cursor = labelEnd + 2; cursor < markdown.length; cursor += 1) {
+      const character = markdown[cursor];
+      if (character === "\n" || character === "\r") break;
+      if (character === "\\") {
+        cursor += 1;
+      } else if (character === "(") {
+        parenthesisDepth += 1;
+      } else if (character === ")") {
+        parenthesisDepth -= 1;
+        if (parenthesisDepth === 0) {
+          destinations.push(markdown.slice(labelEnd + 2, cursor));
+          break;
+        }
+      }
+    }
+  }
+
+  return destinations;
+}
+
+/**
+ * Return whether punctuation is preceded by an odd number of backslashes.
+ *
+ * @param {string} value Source text.
+ * @param {number} index Character index.
+ * @returns {boolean} Whether the character is escaped.
+ */
+function isEscaped(value, index) {
+  let backslashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor -= 1) {
+    backslashes += 1;
+  }
+  return backslashes % 2 === 1;
+}
+
+/**
+ * Remove fenced, indented, and inline code so examples are not treated as
+ * live links.
+ *
+ * @param {string} markdown Page source.
+ * @returns {string} Markdown with code regions removed.
+ */
+function stripMarkdownCode(markdown) {
+  let fence = null;
+  let indentedCodeIndent = null;
+  let canStartIndentedCode = true;
+  const listContentIndents = [];
+  const lines = markdown.split(/\r?\n/).map((line) => {
+    const marker = line.match(/^\s*(`{3,}|~{3,})/)?.[1];
+    if (marker) {
+      if (!fence) {
+        fence = marker;
+      } else if (marker[0] === fence[0] && marker.length >= fence.length) {
+        fence = null;
+      }
+      canStartIndentedCode = true;
+      return "";
+    }
+    if (fence) return "";
+
+    const blank = /^\s*$/.test(line);
+    const indent = leadingIndentWidth(line);
+    if (indentedCodeIndent !== null) {
+      if (blank || indent >= indentedCodeIndent) {
+        canStartIndentedCode = blank;
+        return "";
+      }
+      indentedCodeIndent = null;
+    }
+
+    if (blank) {
+      canStartIndentedCode = true;
+      return line;
+    }
+
+    while (
+      listContentIndents.length > 0 &&
+      indent < listContentIndents.at(-1)
+    ) {
+      listContentIndents.pop();
+    }
+
+    const requiredCodeIndent = (listContentIndents.at(-1) ?? 0) + 4;
+    if (canStartIndentedCode && indent >= requiredCodeIndent) {
+      indentedCodeIndent = requiredCodeIndent;
+      canStartIndentedCode = false;
+      return "";
+    }
+
+    const listMarker = line.match(
+      /^([ \t]*)(?:[-+*]|\d{1,9}[.)])([ \t]+)/,
+    );
+    if (listMarker) {
+      listContentIndents.push(columnWidth(listMarker[0]));
+    }
+
+    canStartIndentedCode = /^(?: {0,3}#{1,6}(?:[ \t]+|$)| {0,3}(?:=+|-+)[ \t]*$| {0,3}\[[^\]\n]+\]:)/.test(
+      line,
+    );
+    return line;
+  });
+
+  return lines.join("\n").replace(/`+[^`\n]*`+/g, "");
+}
+
+/**
+ * Count indentation columns, expanding tabs to four-column stops.
+ *
+ * @param {string} value Source line or prefix.
+ * @returns {number} Leading indentation width in columns.
+ */
+function leadingIndentWidth(value) {
+  return columnWidth(value.match(/^[ \t]*/)[0]);
+}
+
+/**
+ * Count source columns, expanding tabs to four-column stops.
+ *
+ * @param {string} value Source text.
+ * @returns {number} Width in columns.
+ */
+function columnWidth(value) {
+  let width = 0;
+  for (const character of value) {
+    if (character === "\t") {
+      width += 4 - (width % 4);
+    } else {
+      width += 1;
+    }
+  }
+  return width;
+}
+
+/**
+ * Apply CommonMark's case-insensitive, whitespace-collapsing reference label rules.
+ *
+ * @param {string} label Raw reference label.
+ * @returns {string} Normalized reference label.
+ */
+function normalizeReferenceLabel(label) {
+  return label.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+/**
+ * Read the destination portion before an optional Markdown link title.
+ *
+ * @param {string} raw Raw content inside link parentheses.
+ * @returns {string} Link destination.
+ */
+function parseMarkdownDestination(raw) {
+  const value = raw.trim();
+  if (value.startsWith("<")) {
+    const end = value.indexOf(">");
+    return end === -1 ? value : value.slice(1, end);
+  }
+  return value.split(/\s+/, 1)[0];
+}
+
+/**
+ * Return whether a destination has a URL scheme or protocol-relative host.
+ *
+ * @param {string} href Link destination.
+ * @returns {boolean} Whether the destination is external.
+ */
+function isExternalDestination(href) {
+  return href.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(href);
 }
 
 /**
