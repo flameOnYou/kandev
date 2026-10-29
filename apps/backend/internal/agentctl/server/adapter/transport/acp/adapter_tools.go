@@ -139,8 +139,7 @@ func (a *Adapter) convertToolCallUpdate(sessionID string, tc *acp.SessionUpdateT
 		sessionID,
 		toolCallID,
 		normalizedPayload,
-		tc.Meta,
-		string(tc.Status),
+		tc,
 	)
 	if suppress {
 		return nil
@@ -185,16 +184,17 @@ func (a *Adapter) trackToolCallPayload(
 	sessionID string,
 	toolCallID string,
 	payload *streams.NormalizedPayload,
-	meta map[string]any,
-	status string,
+	call *acp.SessionUpdateToolCall,
 ) (*streams.NormalizedPayload, string, codexSubagentSignal, string, string, bool) {
 	eventType := streams.EventTypeToolCall
 	signal := codexSubagentSignalNone
+	meta := call.Meta
 	if a.agentID == codexAgentID {
-		signal = codexSubagentSignalFromMeta(meta)
+		meta = codexSubagentMetadata(meta, call.Title, call.RawInput)
+		signal = codexSubagentSignalFromFrame(meta, call.Title, call.RawInput)
 	}
 	if signal == codexSubagentSignalCollaboration && payload != nil && payload.SubagentTask() != nil && payload.SubagentTask().Status == "" {
-		fillCodexStatus(payload.SubagentTask(), status)
+		fillCodexStatus(payload.SubagentTask(), string(call.Status))
 	}
 
 	a.mu.Lock()
@@ -510,7 +510,7 @@ func (a *Adapter) codexSubagentUpdateTargetLocked(
 	if a.agentID != codexAgentID {
 		return payload, wireToolCallID, "", false
 	}
-	signal := codexSubagentSignalFromMeta(meta)
+	signal := codexSubagentSignalFromFrame(meta, title, rawInput)
 	if signal == codexSubagentSignalNone {
 		return payload, wireToolCallID, "", false
 	}

@@ -106,7 +106,7 @@ func (t *promptTurnState) observeCapacityToolCall(call *acpsdk.SessionUpdateTool
 		t.capacityUnknown = true
 		return
 	}
-	if codexSubagentSignalFromMeta(call.Meta) != codexSubagentSignalNone || parentToolUseID(call.Meta) != "" {
+	if codexSubagentSignalFromFrame(call.Meta, call.Title, call.RawInput) != codexSubagentSignalNone || parentToolUseID(call.Meta) != "" {
 		t.capacityBackground = true
 	}
 	if !validCapacityToolStatus(call.Status) {
@@ -123,7 +123,11 @@ func (t *promptTurnState) observeCapacityToolUpdate(update *acpsdk.SessionToolCa
 		t.capacityUnknown = true
 		return
 	}
-	if codexSubagentSignalFromMeta(update.Meta) != codexSubagentSignalNone || parentToolUseID(update.Meta) != "" {
+	title := ""
+	if update.Title != nil {
+		title = *update.Title
+	}
+	if codexSubagentSignalFromFrame(update.Meta, title, update.RawInput) != codexSubagentSignalNone || parentToolUseID(update.Meta) != "" {
 		t.capacityBackground = true
 	}
 	if update.Kind != nil {
