@@ -13,6 +13,7 @@ import (
 const codexV2ActivityStart = `{"sessionUpdate":"tool_call","toolCallId":"activity-start","title":"Start subagent reviewer","kind":"other","status":"in_progress","rawInput":{"agentThreadId":"child-1","agentPath":"/root/reviewer","activityKind":"started"}}`
 const codexV2SpawnStart = `{"sessionUpdate":"tool_call","toolCallId":"spawn","title":"spawnAgent","kind":"other","status":"in_progress","rawInput":{"prompt":"Review the adapter","senderThreadId":"parent","receiverThreadIds":[],"agentsStates":{},"model":null,"reasoningEffort":null,"status":"inProgress"}}`
 const codexV2SpawnResult = `{"sessionUpdate":"tool_call_update","toolCallId":"spawn","title":"spawnAgent","status":"completed","rawInput":{"prompt":"Review the adapter","senderThreadId":"parent","receiverThreadIds":["child-1"],"agentsStates":{"child-1":{"status":"running","message":null}},"model":"gpt-6.1-sol","reasoningEffort":"high","status":"completed"}}`
+const codexV2SpawnResultWithoutTitle = `{"sessionUpdate":"tool_call_update","toolCallId":"spawn","status":"completed","rawInput":{"prompt":"Review the adapter","senderThreadId":"parent","receiverThreadIds":["child-1"],"agentsStates":{"child-1":{"status":"running","message":null}},"model":"gpt-6.1-sol","reasoningEffort":"high","status":"completed"}}`
 
 // @covers AC-AGENTS-CODEX-SUBAGENT-WIRE-001.1, AC-AGENTS-CODEX-SUBAGENT-WIRE-001.2
 func TestCodexV2ActivityLifecycle(t *testing.T) {
@@ -60,7 +61,7 @@ func TestCodexV2SpawnResultEnrichesAndCorrelates(t *testing.T) {
 	if err := json.Unmarshal([]byte(codexV2SpawnStart), &start); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal([]byte(codexV2SpawnResult), &result); err != nil {
+	if err := json.Unmarshal([]byte(codexV2SpawnResultWithoutTitle), &result); err != nil {
 		t.Fatal(err)
 	}
 	started := a.convertToolCallUpdate("session", &start)
@@ -79,6 +80,29 @@ func TestCodexV2SpawnResultEnrichesAndCorrelates(t *testing.T) {
 	terminal.Meta = nil
 	if got := a.convertToolCallUpdate("session", terminal); got == nil || got.ToolCallID != started.ToolCallID {
 		t.Fatalf("child identified by the result must remain correlatable: %+v", got)
+	}
+}
+
+func TestCodexV2TitlelessSpawnResultNeedsTrackedIdentity(t *testing.T) {
+	var result acpsdk.SessionToolCallUpdate
+	if err := json.Unmarshal([]byte(codexV2SpawnResultWithoutTitle), &result); err != nil {
+		t.Fatal(err)
+	}
+
+	a := newCodexCorrelationTestAdapter()
+	a.mu.Lock()
+	_, _, _, inferredTitle, suppress := a.codexSubagentUpdateTargetLocked(
+		"session",
+		string(result.ToolCallId),
+		nil,
+		"",
+		result.RawInput,
+		result.Title == nil,
+	)
+	a.mu.Unlock()
+
+	if inferredTitle != "" || suppress {
+		t.Fatalf("an untracked title-less update must not acquire spawn identity: title=%q suppress=%v", inferredTitle, suppress)
 	}
 }
 

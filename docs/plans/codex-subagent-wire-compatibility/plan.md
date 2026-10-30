@@ -1,5 +1,9 @@
 ---
 status: implemented
+requirements:
+  - REQ-AGENTS-CODEX-SUBAGENT-WIRE-001
+system_design:
+  - ../../specs/agents/system-design/codex-subagent-wire-compatibility.md
 ---
 
 # Codex Subagent Wire Compatibility Plan
