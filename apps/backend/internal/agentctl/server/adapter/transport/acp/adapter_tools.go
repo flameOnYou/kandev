@@ -714,6 +714,7 @@ func (a *Adapter) convertToolCallResultUpdate(sessionID string, tcu *acp.Session
 	// under the lock so it can gate on payload kind (subagent_task only).
 	isAsyncLaunchedSub := isSubagentAsyncLaunched(tcu.Meta)
 	supplemental := toolCallUpdateSupplemental(tcu)
+	pluginPromptGeneration := a.currentPromptGeneration()
 
 	a.mu.Lock()
 	updateTitle := ""
@@ -784,6 +785,7 @@ func (a *Adapter) convertToolCallResultUpdate(sessionID string, tcu *acp.Session
 	if payload != nil && payload.Kind() == streams.ToolKindShellExec {
 		recognizedShellUpdate = a.normalizer.NormalizeShellToolUpdate(payload, tcu.Meta, convertedContents, tcu.RawOutput)
 		a.normalizer.confirmBackgroundLaunch(payload, tcu.RawOutput)
+		a.recordOpenCodePluginClaimLocked(string(tcu.ToolCallId), pluginPromptGeneration, payload)
 	} else if tcu.RawOutput != nil && payload != nil && !isTrackedMonitorTerminal {
 		result := tcu.RawOutput
 		if canonicalMCPUpdate {
